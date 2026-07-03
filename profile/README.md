@@ -24,7 +24,7 @@ These are not marketing. They are the filter we apply when deciding what to buil
 
 - **[Nanocoder](https://github.com/Nano-Collective/nanocoder)** — a coding agent in your terminal that runs on any model you choose.
 - **[Nanotune](https://github.com/Nano-Collective/nanotune)** — tooling for fine tuning and improving small, local models for practical use.
-- **[get-md](https://github.com/Nano-Collective/get-md)** — a fast, lightweight HTML to Markdown converter optimised for LLM consumption.
+- **[get-md](https://github.com/Nano-Collective/get-md)** — a fast, lightweight HTML, PDF, DOCX, and Markdown to Markdown converter optimised for LLM consumption.
 - **[json-up](https://github.com/Nano-Collective/json-up)** — a type safe JSON migration tool with Zod schema validation.
 
 Each project runs independently, with its own maintainers, roadmap, and release cadence. They share a consistent approach to how they are structured, tested, released, and presented, so the collective stays legible from the outside and contributors can move easily between projects.
