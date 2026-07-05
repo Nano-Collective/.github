@@ -26,7 +26,7 @@ These are not marketing. They are the filter we apply when deciding what to buil
 - **[Nanotune](https://github.com/Nano-Collective/nanotune)** — tooling for fine tuning and improving small, local models for practical use.
 - **[get-md](https://github.com/Nano-Collective/get-md)** — a fast, lightweight HTML, PDF, DOCX, and Markdown to Markdown converter optimised for LLM consumption.
 - **[json-up](https://github.com/Nano-Collective/json-up)** — a type safe JSON migration tool with Zod schema validation.
-
+- **[prompt-scrub](https://github.com/Nano-Collective/prompt-scrubber)** — a Local-first tool that strips identifying content out of your prompts before they reach a cloud LLM.
 Each project runs independently, with its own maintainers, roadmap, and release cadence. They share a consistent approach to how they are structured, tested, released, and presented, so the collective stays legible from the outside and contributors can move easily between projects.
 
 ## Where we are heading
