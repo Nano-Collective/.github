@@ -47,6 +47,12 @@ on:
         description: 'Run the Verify Build job. Disable for repos with no build step.'
         type: boolean
         default: true
+      build-before-tests:
+        description: >-
+          Run `pnpm build` before the test suite. Required wherever CLI
+          integration tests invoke the built entry point rather than source.
+        type: boolean
+        default: true
       build-output-dir:
         description: 'Directory that must exist and be non-empty after a build.'
         type: string
@@ -188,6 +194,12 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # CLI integration tests spawn the built binary, so dist/ has to exist
+      # before the suite runs or every one of them fails.
+      - name: Build project
+        if: ${{ inputs.build-before-tests }}
+        run: pnpm build
 
       - name: Run unit tests with coverage
         run: pnpm test:ava:coverage
