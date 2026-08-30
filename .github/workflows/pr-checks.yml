@@ -15,16 +15,15 @@ name: PR Checks
 #               These are the checks named in the org "Quality gates" ruleset.
 #               A red one stops the merge.
 #
-#   ADVISORY  — Package Audit Analysis, CodeQL Security Analysis.
-#               These run on every PR and report, but never fail it. They depend
-#               on upstream advisory feeds and third-party scanners, so a
-#               disclosure landing overnight must not block an unrelated
-#               contributor's bug fix. Findings are surfaced in the job summary
-#               and swept up by the org-wide audit run.
+#   ADVISORY  — Package Audit Analysis, Semgrep Security Scan, CodeQL Security
+#               Analysis. These run on every PR and report, but never fail it.
+#               They depend on upstream advisory feeds and third-party scanners,
+#               so a disclosure landing overnight must not block an unrelated
+#               contributor's bug fix.
 #
-# Semgrep has no job of its own: `test:security` is `semgrep scan --config auto
-# --error` in every repo, so it runs inside Package Audit Analysis rather than
-# scanning the same tree twice per pull request.
+# Semgrep runs in its own job on the semgrep/semgrep image. It is deliberately
+# NOT invoked as `pnpm test:security` from the audit job: that script assumes
+# semgrep is already on PATH, which is true locally and false on a bare runner.
 #
 # Toolchain is fixed: pnpm 11.0.9 on Node 22, matching every repo in the org.
 # Repo-specific build steps stay in the calling repo as their own job rather
@@ -339,12 +338,27 @@ jobs:
       - name: Run security audit
         run: pnpm test:audit
 
-      - name: Run dependency policy check
-        run: pnpm test:security
-
       - name: Check for outdated dependencies
         continue-on-error: true
         run: pnpm outdated || echo "Some dependencies are outdated"
+
+  semgrep-scan:
+    name: Semgrep Security Scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      # Equivalent to each repo's `test:security` script, but run on an image
+      # that actually ships semgrep.
+      - name: Run Semgrep
+        run: semgrep scan --config auto --error
 
   codeql-scan:
     name: CodeQL Security Analysis
