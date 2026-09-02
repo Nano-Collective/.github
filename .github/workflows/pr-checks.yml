@@ -1,9 +1,18 @@
 name: PR Checks
 
-# Shared pull-request checks for every Nano Collective repository.
+# Shared checks for every Nano Collective repository. Designed to be triggered
+# on pull_request, but every step tolerates a push to a branch in
+# `branches:` (i.e. main) as well — direct pushes are uncommon but allowed,
+# and historically landed without review in several org repos. Coverage drift
+# falls back to HEAD~1 when no base ref exists; everything else is event-agnostic.
 #
 # Callers pin this with:
 #
+#   on:
+#     pull_request:
+#       branches: [main]
+#     push:
+#       branches: [main]
 #   jobs:
 #     pr-checks:
 #       uses: Nano-Collective/.github/.github/workflows/pr-checks.yml@main
@@ -16,10 +25,10 @@ name: PR Checks
 #               A red one stops the merge.
 #
 #   ADVISORY  — Package Audit Analysis, Semgrep Security Scan, CodeQL Security
-#               Analysis. These run on every PR and report, but never fail it.
-#               They depend on upstream advisory feeds and third-party scanners,
-#               so a disclosure landing overnight must not block an unrelated
-#               contributor's bug fix.
+#               Analysis. These run on every invocation and report, but never
+#               fail it. They depend on upstream advisory feeds and third-party
+#               scanners, so a disclosure landing overnight must not block an
+#               unrelated contributor's bug fix.
 #
 # Semgrep runs in its own job on the semgrep/semgrep image. It is deliberately
 # NOT invoked as `pnpm test:security` from the audit job: that script assumes
@@ -72,7 +81,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Install pnpm
@@ -97,7 +106,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Install pnpm
@@ -122,7 +131,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Install pnpm
@@ -147,7 +156,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Install pnpm
@@ -180,7 +189,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Install pnpm
@@ -218,7 +227,12 @@ jobs:
         env:
           THRESHOLD: ${{ inputs.coverage-threshold }}
           FAIL_ON_DROP: ${{ inputs.fail-on-coverage-drop }}
-          BASE_REF: ${{ github.base_ref }}
+          # On pull_request this is the branch the PR targets (e.g. main).
+          # On push events github.base_ref is null, so fall back to HEAD~1 —
+          # the previous commit on the branch that was just pushed to. The
+          # runner has a full clone (fetch-depth: 0), so the local lookup
+          # needs no fetch.
+          BASE_REF: ${{ github.base_ref || 'HEAD~1' }}
         run: |
           set -euo pipefail
 
@@ -246,8 +260,14 @@ jobs:
           # without the badge yet simply skips this check rather than failing.
           BASELINE=""
           if [ "${FAIL_ON_DROP}" = "true" ]; then
-            git fetch --no-tags --depth=1 origin "${BASE_REF}" || true
-            BADGE=$(git show "origin/${BASE_REF}:badges/coverage.svg" 2>/dev/null || true)
+            # Local lookup on a direct push (BASE_REF is HEAD~1), remote lookup
+            # on a pull_request (BASE_REF is e.g. main).
+            if [[ "${BASE_REF}" == "HEAD~1" ]]; then
+              BADGE=$(git show "HEAD~1:badges/coverage.svg" 2>/dev/null || true)
+            else
+              git fetch --no-tags --depth=1 origin "${BASE_REF}" || true
+              BADGE=$(git show "origin/${BASE_REF}:badges/coverage.svg" 2>/dev/null || true)
+            fi
             if [ -n "${BADGE}" ]; then
               BASELINE=$(printf '%s' "${BADGE}" \
                 | grep -oE '>[0-9]+(\.[0-9]+)?%<' \
@@ -271,7 +291,7 @@ jobs:
             echo ""
             echo "| | % |"
             echo "|---|---|"
-            echo "| This PR | ${COVERAGE} |"
+            echo "| This run | ${COVERAGE} |"
             echo "| Baseline (\`${BASE_REF}\`) | ${BASELINE:-n/a} |"
             echo "| Threshold | ${THRESHOLD} |"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -286,7 +306,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Install pnpm
@@ -332,7 +352,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Install pnpm
@@ -364,7 +384,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       # Equivalent to each repo's `test:security` script, but run on an image
@@ -389,7 +409,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Initialize CodeQL
