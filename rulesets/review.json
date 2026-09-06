@@ -32,13 +32,6 @@
         "require_extra_approval_for_unattributed_changes": false,
         "allowed_merge_methods": ["merge", "squash", "rebase"]
       }
-    },
-    {
-      "type": "copilot_code_review",
-      "parameters": {
-        "review_draft_pull_requests": false,
-        "review_on_push": false
-      }
     }
   ]
 }
