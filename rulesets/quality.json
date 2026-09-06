@@ -1,0 +1,37 @@
+{
+  "name": "Quality gates",
+  "target": "branch",
+  "enforcement": "evaluate",
+  "conditions": {
+    "ref_name": {
+      "include": ["~DEFAULT_BRANCH"],
+      "exclude": []
+    }
+  },
+  "bypass_actors": [
+    {
+      "actor_id": null,
+      "actor_type": "OrganizationAdmin",
+      "bypass_mode": "always"
+    }
+  ],
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": false,
+        "do_not_enforce_on_create": false,
+        "required_status_checks": [
+          { "context": "pr-checks / Linting", "integration_id": 15368 },
+          { "context": "pr-checks / Type Checks", "integration_id": 15368 },
+          { "context": "pr-checks / Format Checks", "integration_id": 15368 },
+          { "context": "pr-checks / Unused Dependencies", "integration_id": 15368 },
+          { "context": "pr-checks / Unit Tests & Coverage Analysis", "integration_id": 15368 },
+          { "context": "pr-checks / Verify Build", "integration_id": 15368 }
+        ]
+      }
+    }
+  ]
+}
