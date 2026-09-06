@@ -61,9 +61,44 @@ on:
         description: 'Node major version.'
         type: string
         default: '22'
+      validate-changesets:
+        description: >-
+          Check that every .changeset/*.md names a real workspace package.
+          Enable for any repo using changesets. Off by default so repos without
+          them are unaffected.
+        type: boolean
+        default: false
 
 jobs:
   # ---------------------------------------------------------------- blocking
+
+  # A changeset naming a package that does not exist passes every other check
+  # and then breaks `release-prepare` on every subsequent push to main. The
+  # Version PR stops updating and no release can be cut until somebody notices
+  # — nanocoder#1065. `changeset-check` only asserts a changeset FILE was added,
+  # never that the name inside resolves, so that gap is inherited by every repo
+  # adopting changesets. The validator lives here rather than being copied into
+  # each repo.
+  validate-changesets:
+    name: Changeset Validation
+    if: inputs.validate-changesets && github.head_ref != 'changeset-release/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        # pin: actions/checkout@v4.3.1
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Checkout the shared scripts
+        # pin: actions/checkout@v4.3.1
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: Nano-Collective/.github
+          path: .nc-shared
+
+      # Dependency-free and runs before any install, so a broken lockfile
+      # cannot mask a broken changeset.
+      - name: Validate changesets
+        run: node .nc-shared/scripts/validate-changesets.mjs "$GITHUB_WORKSPACE"
 
   test-lint:
     name: Linting

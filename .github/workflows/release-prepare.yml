@@ -1,0 +1,84 @@
+name: Prepare Release (Version PR)
+
+# Keeps a single open "Version Packages" pull request up to date. As changesets
+# land on main, that pull request accumulates them, bumps package.json, and
+# rolls the entries into CHANGELOG.md.
+#
+# This workflow NEVER publishes. Merging the Version PR pushes a version bump to
+# main, which the repository's own release.yml detects and publishes. That split
+# keeps release.yml the single source of truth for publishing, and means a
+# mistake here cannot ship a package.
+#
+# Call it from a repo with:
+#
+#   name: Prepare Release (Version PR)
+#   on:
+#     push:
+#       branches: [main]
+#   permissions:
+#     contents: write
+#     pull-requests: write
+#   jobs:
+#     release-prepare:
+#       uses: Nano-Collective/.github/.github/workflows/release-prepare.yml@main
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node version to build with.
+        type: string
+        default: '22'
+      version-script:
+        description: >
+          Package script that performs the version bump. The default is enough
+          for a plain changesets setup. A repo that post-processes CHANGELOG.md
+          points this at its own script — nanocoder uses `changeset:version`,
+          which runs `changeset version` and then normalises the changelog.
+        type: string
+        default: 'changeset:version'
+      pr-title:
+        description: Title for the Version Packages pull request.
+        type: string
+        default: 'chore: version packages'
+
+concurrency:
+  # Avoid racing the Version PR against itself when several PRs merge quickly.
+  group: release-prepare-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # pin: actions/checkout@v4.3.1
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      # pin: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+
+      # pin: actions/setup-node@v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Create or update the Version Packages PR
+        # pin: changesets/action@v1.5.3
+        uses: changesets/action@e0145edc7d9d8679003495b11f87bd8ef63c0cba
+        with:
+          # `version:` only. No `publish:` input, so this action never runs
+          # `changeset publish` — release.yml owns publishing.
+          version: pnpm run ${{ inputs.version-script }}
+          title: ${{ inputs.pr-title }}
+          commit: ${{ inputs.pr-title }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
