@@ -1,0 +1,198 @@
+name: Update Status Badges
+
+# Regenerates the README status badges and commits them back to the default
+# branch. Shared because all seven package repositories were producing the
+# *same eight badges* from files that had drifted to between 89 and 147 lines —
+# different action pinning, different step names, different quoting, one with an
+# extra build step. Nothing about "fetch a shields.io SVG" is project-specific.
+#
+# The drift had a cost beyond tidiness: several repos pinned their actions by
+# mutable tag (`actions/checkout@v4`), which Semgrep flags as
+# `github-actions-mutable-action-tag` and which kept the advisory security scan
+# permanently red on those repos. Everything here is pinned by SHA, so adopting
+# this clears that finding as a side effect.
+#
+# Call it from a repo with:
+#
+#   name: Update Status Badges
+#   on:
+#     workflow_dispatch:
+#     schedule:
+#       - cron: '0 0 * * *'
+#     release:
+#       types: [published]
+#   permissions:
+#     contents: write
+#   jobs:
+#     badges:
+#       uses: Nano-Collective/.github/.github/workflows/update-badges.yml@main
+#       secrets:
+#         PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+#
+# ---------------------------------------------------------------------------
+# On the push credential
+# ---------------------------------------------------------------------------
+# This job pushes to the default branch, which the org's rulesets protect. Two
+# ways to let it through:
+#
+#   PAT_TOKEN   A personal access token. The push is then made *as that user*,
+#               so it inherits their bypass. This is what every repo except
+#               nanoterm does today. It works, but it means a daily automated
+#               push wearing a human's credentials, and the rule suite records
+#               the bypass against them rather than against the bot — which
+#               makes "track bypass usage per actor" report a person for
+#               something a cron did.
+#
+#   no token    Falls back to GITHUB_TOKEN, pushing as github-actions[bot].
+#               That needs the bot added as a bypass actor on the repo's
+#               rulesets (actor_type: Integration). Preferable: the bypass is
+#               explicit, scoped to automation, and attributable.
+#
+# The secret is optional so both work, and a repo can move from one to the other
+# without touching this file.
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node version to build and test with.
+        type: string
+        default: '22'
+      build-before-tests:
+        description: >
+          Run `pnpm build` before the test suite. Needed where tests spawn the
+          built binary rather than importing source — get-md's CLI e2e tests do.
+        type: boolean
+        default: false
+      coverage-command:
+        description: Package script that emits coverage/coverage-summary.json.
+        type: string
+        default: 'test:ava:coverage'
+      build-command:
+        description: Package script whose success drives the build badge.
+        type: string
+        default: 'build'
+      badge-style:
+        description: shields.io style parameter.
+        type: string
+        default: 'for-the-badge'
+    secrets:
+      PAT_TOKEN:
+        description: >
+          Optional. A token whose push bypasses branch protection. Omit to push
+          as github-actions[bot], which requires the bot to be a bypass actor.
+        required: false
+
+jobs:
+  badges:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # pin: actions/checkout@v4.3.1
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          token: ${{ secrets.PAT_TOKEN || github.token }}
+
+      # pin: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+
+      # pin: actions/setup-node@v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        if: inputs.build-before-tests
+        run: pnpm run ${{ inputs.build-command }}
+
+      # Badges are decoration: a failing suite must still produce a *red* badge
+      # rather than aborting the job and leaving yesterday's green one up.
+      - name: Run tests for coverage
+        run: pnpm run ${{ inputs.coverage-command }} || echo "coverage unavailable"
+
+      - name: Extract coverage
+        id: coverage
+        run: |
+          set -uo pipefail
+          if [ -f coverage/coverage-summary.json ]; then
+            PCT=$(node -p "require('./coverage/coverage-summary.json').total.lines.pct")
+            echo "percentage=$PCT" >> "$GITHUB_OUTPUT"
+          else
+            echo "percentage=N/A" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine build status
+        id: build
+        run: |
+          set -uo pipefail
+          if pnpm run ${{ inputs.build-command }}; then
+            echo "status=passing" >> "$GITHUB_OUTPUT"
+            echo "color=brightgreen" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=failing" >> "$GITHUB_OUTPUT"
+            echo "color=red" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The npm package name comes from package.json and the slug from the
+      # event, so no repo has to restate either — restating them is how the
+      # per-repo copies ended up pointing at the wrong package after a rename.
+      - name: Generate badges
+        env:
+          STYLE: style=${{ inputs.badge-style }}
+          REPO: ${{ github.repository }}
+          COVERAGE: ${{ steps.coverage.outputs.percentage }}
+          BUILD_STATUS: ${{ steps.build.outputs.status }}
+          BUILD_COLOR: ${{ steps.build.outputs.color }}
+        run: |
+          set -euo pipefail
+          mkdir -p badges
+          PKG=$(node -p "require('./package.json').name")
+          echo "package: $PKG   repo: $REPO"
+
+          fetch() { curl -sS --fail-with-body --retry 3 --retry-delay 2 "$1" -o "$2"; }
+
+          if [ "$COVERAGE" != "N/A" ]; then
+            COLOR=$(echo "$COVERAGE" | awk '{print ($1 >= 80) ? "brightgreen" : ($1 >= 50) ? "yellow" : "red"}')
+            fetch "https://img.shields.io/badge/coverage-${COVERAGE}%25-${COLOR}?${STYLE}" badges/coverage.svg
+          else
+            fetch "https://img.shields.io/badge/coverage-N%2FA-lightgrey?${STYLE}" badges/coverage.svg
+          fi
+
+          fetch "https://img.shields.io/badge/build-${BUILD_STATUS}-${BUILD_COLOR}?${STYLE}&logo=githubactions" badges/build.svg
+          fetch "https://img.shields.io/npm/v/${PKG}?${STYLE}&logo=npm"                badges/npm-version.svg
+          fetch "https://img.shields.io/npm/dm/${PKG}?${STYLE}&logo=npm"               badges/npm-downloads-monthly.svg
+          fetch "https://img.shields.io/npm/l/${PKG}?${STYLE}"                         badges/npm-license.svg
+          fetch "https://img.shields.io/github/repo-size/${REPO}?${STYLE}&logo=github" badges/repo-size.svg
+          fetch "https://img.shields.io/github/stars/${REPO}?${STYLE}&logo=github"     badges/stars.svg
+          fetch "https://img.shields.io/github/forks/${REPO}?${STYLE}&logo=github"     badges/forks.svg
+
+      # A truncated or error-page SVG committed over a good badge is worse than
+      # a stale one, and shields.io returning HTML on a bad package name is the
+      # likely way that happens.
+      - name: Verify the badges are SVG
+        run: |
+          set -euo pipefail
+          for file in badges/*.svg; do
+            if ! head -c 400 "$file" | grep -qi '<svg'; then
+              echo "::error::$file is not SVG — refusing to commit it"
+              head -c 200 "$file"
+              exit 1
+            fi
+          done
+
+      - name: Commit and push badges
+        run: |
+          set -euo pipefail
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add badges/
+          if git diff --cached --quiet; then
+            echo "badges unchanged"
+            exit 0
+          fi
+          git commit -m "chore: update status badges [skip ci]"
+          git push
