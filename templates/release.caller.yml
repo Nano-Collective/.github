@@ -1,0 +1,33 @@
+name: Release to NPM and GitHub
+
+# Thin caller for the shared org workflow. Everything lives in
+# Nano-Collective/.github — change it there and every repo picks it up.
+#
+# Publishes only when package.json's version is ahead of what is on npm, so
+# merging the Version Packages PR is what triggers a release. Nothing else does.
+#
+# Adjust the inputs below to match the repo; the defaults suit a CLI package
+# that builds to dist/cli.js and has scripts/extract-changelog.js.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  packages: write
+  # Required for npm publish --provenance (OIDC build attestation).
+  id-token: write
+
+jobs:
+  release:
+    uses: Nano-Collective/.github/.github/workflows/release.yml@main
+    with:
+      # Paths that must exist after the build. A publish of an empty package
+      # succeeds silently, so name whatever this package actually ships.
+      verify-files: 'dist/cli.js dist/index.js'
+      install-command: 'npm install {pkg}@{version}'
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Optional — omit the line entirely in a repo with no webhook.
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}

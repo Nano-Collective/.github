@@ -1,0 +1,353 @@
+name: Release to NPM and GitHub
+
+# Publishes to npm and cuts a GitHub Release when package.json's version is
+# ahead of what is on the registry. Shared because six repos were doing the same
+# four jobs — check-version, publish, release, notify — from files that had
+# drifted to between 76 and 256 lines.
+#
+# The drift was not cosmetic. get-md was still calling actions/create-release@v1,
+# which GitHub archived in 2021, and both it and prompt-scrubber pinned every
+# action by mutable tag — which is what keeps Semgrep's advisory scan red on
+# those two repos. Everything here is pinned by SHA and uses the maintained
+# release action.
+#
+# Call it from a repo with:
+#
+#   name: Release to NPM and GitHub
+#   on:
+#     push:
+#       branches: [main]
+#   permissions:
+#     contents: write
+#     packages: write
+#     id-token: write        # required for npm provenance
+#   jobs:
+#     release:
+#       uses: Nano-Collective/.github/.github/workflows/release.yml@main
+#       secrets:
+#         NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+#
+# ---------------------------------------------------------------------------
+# The guard that matters
+# ---------------------------------------------------------------------------
+# `check-version` reads the *full published list* rather than `npm view … version`.
+# That call resolves the `latest` dist-tag, which pre-1.0 can lag behind the
+# newest prerelease — so a version already on npm would be reported as new and
+# the publish would fail loudly every push. Reading the list makes
+# "already published?" an exact membership test.
+#
+# Nothing publishes unless that test says the version is genuinely new, so the
+# failure mode of a mistake here is a release that does not happen, which is
+# loud, rather than one that ships the wrong thing.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: '22'
+      build-command:
+        description: Package script that produces the publishable output.
+        type: string
+        default: 'build'
+      test-command:
+        description: >
+          Package script run before publishing. The full gate by default —
+          this is the last chance to catch a broken release.
+        type: string
+        default: 'test:all'
+      verify-files:
+        description: >
+          Space-separated paths that must exist after the build. A publish of an
+          empty package succeeds silently, so this is the cheap check that the
+          build actually produced something.
+        type: string
+        default: 'dist/cli.js'
+      changelog-script:
+        description: >
+          Node script printing this version's changelog to stdout. Skipped when
+          the file is absent, in which case the release body says so rather than
+          failing.
+        type: string
+        default: 'scripts/extract-changelog.js'
+      release-name:
+        description: >
+          Display name for the GitHub Release, without the version. Defaults to
+          the repository name.
+        type: string
+        default: ''
+      install-command:
+        description: >
+          Shown in the release body under "Install". `{pkg}` and `{version}` are
+          substituted.
+        type: string
+        default: 'npm install {pkg}@{version}'
+      keep-latest-on-prerelease:
+        description: >
+          Pre-1.0, every published version is a prerelease and goes out under
+          alpha/beta/rc, never claiming `latest` — which leaves `latest` pinned
+          to whatever was published without an explicit tag, so `npx <pkg>`
+          installs a stale build. This moves `latest` onto each new prerelease
+          until a stable version exists to claim it.
+        type: boolean
+        default: true
+    secrets:
+      NPM_TOKEN:
+        required: true
+      DISCORD_WEBHOOK_URL:
+        description: Optional. A release notification is posted when set.
+        required: false
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should-publish: ${{ steps.check.outputs.should-publish }}
+      package-version: ${{ steps.check.outputs.package-version }}
+      package-name: ${{ steps.check.outputs.package-name }}
+      npm-version: ${{ steps.check.outputs.npm-version }}
+      is-prerelease: ${{ steps.check.outputs.is-prerelease }}
+      npm-tag: ${{ steps.check.outputs.npm-tag }}
+    steps:
+      # pin: actions/checkout@v4.3.1
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      # pin: actions/setup-node@v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Check version against the registry
+        id: check
+        run: |
+          set -euo pipefail
+          # Exported so the inline node below can read it.
+          export PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          echo "package-version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "package-name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
+
+          case "$PACKAGE_VERSION" in
+            *-alpha*) PRE=true; TAG=alpha ;;
+            *-beta*)  PRE=true; TAG=beta ;;
+            *-rc*)    PRE=true; TAG=rc ;;
+            *)        PRE=false; TAG=latest ;;
+          esac
+          echo "is-prerelease=$PRE" >> "$GITHUB_OUTPUT"
+          echo "npm-tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # The full list, not `npm view … version` — see the header note.
+          VERSIONS_JSON=$(npm view "$PACKAGE_NAME" versions --json 2>/dev/null || echo "[]")
+
+          NPM_VERSION=$(echo "$VERSIONS_JSON" | node -e '
+            let raw = "";
+            process.stdin.on("data", d => (raw += d)).on("end", () => {
+              const parsed = raw.trim() ? JSON.parse(raw) : [];
+              const versions = Array.isArray(parsed) ? parsed : [parsed];
+              console.log(versions.at(-1) ?? "0.0.0");
+            });
+          ')
+          echo "npm-version=$NPM_VERSION" >> "$GITHUB_OUTPUT"
+
+          ALREADY=$(echo "$VERSIONS_JSON" | node -e '
+            let raw = "";
+            process.stdin.on("data", d => (raw += d)).on("end", () => {
+              const parsed = raw.trim() ? JSON.parse(raw) : [];
+              const versions = Array.isArray(parsed) ? parsed : [parsed];
+              console.log(versions.includes(process.env.PACKAGE_VERSION) ? "yes" : "no");
+            });
+          ')
+
+          if [ "$ALREADY" = "no" ]; then
+            echo "New version: $PACKAGE_VERSION (newest on npm: $NPM_VERSION)"
+            echo "should-publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Already published: $PACKAGE_VERSION"
+            echo "should-publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    needs: check-version
+    if: needs.check-version.outputs.should-publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+      # pin: actions/checkout@v4.3.1
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      # pin: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+
+      # pin: actions/setup-node@v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run ${{ inputs.build-command }}
+
+      - name: Test
+        run: pnpm run ${{ inputs.test-command }}
+
+      # An npm publish of an empty package succeeds. This is the cheap check
+      # that the build produced what the package claims to ship.
+      - name: Verify build output
+        env:
+          FILES: ${{ inputs.verify-files }}
+        run: |
+          set -euo pipefail
+          for f in $FILES; do
+            if [ ! -f "$f" ]; then
+              echo "::error::build did not produce $f — refusing to publish"
+              exit 1
+            fi
+          done
+          echo "build output present: $FILES"
+
+      - name: Extract changelog
+        id: changelog
+        env:
+          SCRIPT: ${{ inputs.changelog-script }}
+        run: |
+          set -uo pipefail
+          if [ -n "$SCRIPT" ] && [ -f "$SCRIPT" ] && OUT=$(node "$SCRIPT" 2>&1); then
+            {
+              echo "body<<CHANGELOG_EOF"
+              echo "$OUT"
+              echo "CHANGELOG_EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "body=No changelog available for this version." >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to NPM
+        run: npm publish --provenance --access public --tag "${{ needs.check-version.outputs.npm-tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Keep latest on the newest prerelease
+        if: >
+          inputs.keep-latest-on-prerelease &&
+          needs.check-version.outputs.is-prerelease == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PKG: ${{ needs.check-version.outputs.package-name }}
+          VERSION: ${{ needs.check-version.outputs.package-version }}
+        run: |
+          set -euo pipefail
+          HAS_STABLE=$(npm view "$PKG" versions --json 2>/dev/null | node -e '
+            let raw = "";
+            process.stdin.on("data", d => (raw += d)).on("end", () => {
+              const parsed = raw.trim() ? JSON.parse(raw) : [];
+              const versions = Array.isArray(parsed) ? parsed : [parsed];
+              console.log(versions.some(v => !v.includes("-")) ? "yes" : "no");
+            });
+          ')
+          if [ "$HAS_STABLE" = "yes" ]; then
+            echo "a stable version exists — leaving the latest tag alone"
+          else
+            npm dist-tag add "$PKG@$VERSION" latest
+            echo "latest now points at $VERSION"
+          fi
+
+      - name: Compose the release body
+        id: body
+        env:
+          PKG: ${{ needs.check-version.outputs.package-name }}
+          VERSION: ${{ needs.check-version.outputs.package-version }}
+          PREVIOUS: ${{ needs.check-version.outputs.npm-version }}
+          INSTALL_TEMPLATE: ${{ inputs.install-command }}
+          CHANGELOG: ${{ steps.changelog.outputs.body }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          INSTALL=${INSTALL_TEMPLATE//\{pkg\}/$PKG}
+          INSTALL=${INSTALL//\{version\}/$VERSION}
+          {
+            echo "body<<RELEASE_EOF"
+            echo "## What's Changed"
+            echo
+            echo "$CHANGELOG"
+            echo
+            echo "### Install"
+            echo
+            echo '```bash'
+            echo "$INSTALL"
+            echo '```'
+            echo
+            echo "**Full Changelog**: https://github.com/$REPO/compare/v$PREVIOUS...v$VERSION"
+            echo "RELEASE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # pin: softprops/action-gh-release@v2
+      # Replaces actions/create-release@v1, which GitHub archived in 2021 and
+      # which get-md was still calling.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        with:
+          tag_name: v${{ needs.check-version.outputs.package-version }}
+          name: >-
+            ${{ inputs.release-name || github.event.repository.name }}
+            v${{ needs.check-version.outputs.package-version }}
+          prerelease: ${{ needs.check-version.outputs.is-prerelease == 'true' }}
+          body: ${{ steps.body.outputs.body }}
+
+  notify:
+    needs: [check-version, publish]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report the outcome
+        env:
+          SHOULD: ${{ needs.check-version.outputs.should-publish }}
+          RESULT: ${{ needs.publish.result }}
+          PKG: ${{ needs.check-version.outputs.package-name }}
+          VERSION: ${{ needs.check-version.outputs.package-version }}
+        run: |
+          set -euo pipefail
+          if [ "$SHOULD" != "true" ]; then
+            echo "no new version to publish"
+            exit 0
+          fi
+          if [ "$RESULT" = "success" ]; then
+            echo "published $PKG v$VERSION"
+          else
+            echo "::error::failed to publish $PKG v$VERSION"
+            exit 1
+          fi
+
+      - name: Announce on Discord
+        if: >
+          needs.check-version.outputs.should-publish == 'true' &&
+          needs.publish.result == 'success'
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PKG: ${{ needs.check-version.outputs.package-name }}
+          VERSION: ${{ needs.check-version.outputs.package-version }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WEBHOOK:-}" ]; then
+            echo "no DISCORD_WEBHOOK_URL — skipping"
+            exit 0
+          fi
+          # A failed announcement must not fail a release that already shipped.
+          node -e '
+            const body = JSON.stringify({
+              content: `**${process.env.PKG}** v${process.env.VERSION} released — https://github.com/${process.env.REPO}/releases/tag/v${process.env.VERSION}`,
+            });
+            fetch(process.env.WEBHOOK, {
+              method: "POST",
+              headers: {"content-type": "application/json"},
+              body,
+            }).then(r => console.log("discord:", r.status))
+              .catch(e => console.log("discord failed:", e.message));
+          ' || echo "discord announcement failed, ignoring"
