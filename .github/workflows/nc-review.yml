@@ -47,6 +47,13 @@ on:
           number in the event.
         type: string
         default: ''
+      base-rubric-url:
+        description: >
+          The shared reviewing method, fetched into the workspace at run time.
+          Pinned to a tag or SHA rather than main if you need a project's
+          reviews to stay fixed while the shared method changes.
+        type: string
+        default: 'https://raw.githubusercontent.com/Nano-Collective/.github/main/nc-review/rubric-base.md'
       rubric-path:
         description: >
           The repository's own review rubric. Shared workflow, per-repo rubric —
@@ -187,6 +194,31 @@ jobs:
           npm run build
           npm link
           nanocoder --version || true
+
+      # The base rubric is the reviewing METHOD — how to read a diff against a
+      # base checkout, how to rate severity, what to emit. It is identical for
+      # every project, so it lives here rather than being copied into each one:
+      # nine copies of "read the code before judging it" would drift, and the
+      # parts most likely to be corrupted by a copy-paste edit are the output
+      # schema and the base-commit semantics, which are the two things a wrong
+      # review depends on.
+      #
+      # It has to be fetched rather than read in place, because the checkout is
+      # the calling repository and Nanocoder's file tools refuse anything
+      # outside the project directory.
+      - name: Fetch the shared reviewing method
+        env:
+          BASE_RUBRIC_URL: ${{ inputs.base-rubric-url }}
+        run: |
+          set -euo pipefail
+          mkdir -p .nc-review
+          curl -fsSL "$BASE_RUBRIC_URL" -o .nc-review/rubric-base.md
+          # A truncated or 404'd rubric would produce a confident review with no
+          # method behind it, so fail loudly instead.
+          test -s .nc-review/rubric-base.md
+          grep -q '## Output' .nc-review/rubric-base.md \
+            || { echo "::error::base rubric fetched but looks wrong (no Output section)"; exit 1; }
+          echo "base rubric: $(wc -l < .nc-review/rubric-base.md) lines"
 
       - name: Assemble review context
         id: ctx
@@ -472,7 +504,8 @@ jobs:
           if [ -n "$ARCHITECTURE_DOC" ] && [ -f "$ARCHITECTURE_DOC" ]; then
             READING="$ARCHITECTURE_DOC for the architecture, $READING"
           fi
-          READING="$RUBRIC_PATH for your instructions, $READING"
+          READING="$RUBRIC_PATH for what this project cares about, $READING"
+          READING=".nc-review/rubric-base.md for how to review, $READING"
           echo "reading list: $READING"
           # The prompt is deliberately short and points at files on disk. Passing
           # a multi-KB diff through argv round-trips it via sh -c and pnpm's
@@ -635,7 +668,7 @@ jobs:
             # Actions keeps only one queued run per group and cancels the rest,
             # which would silently drop reviews instead of delaying them.
             sleep 60
-            RETRY='Read '"$RUBRIC_PATH"' and .nc-review/context.md, then write your review verdict as a single JSON object to .nc-review/verdict.json using write_file. Use exactly these keys, spelled exactly this way. Every finding MUST carry area, severity and detail; file and line may be omitted, nothing else may be:
+            RETRY='Read .nc-review/rubric-base.md, '"$RUBRIC_PATH"' and .nc-review/context.md, then write your review verdict as a single JSON object to .nc-review/verdict.json using write_file. Use exactly these keys, spelled exactly this way. Every finding MUST carry area, severity and detail; file and line may be omitted, nothing else may be:
 
             '"$SCHEMA"'
 
