@@ -23,13 +23,11 @@ ORG="Nano-Collective"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RULESET_DIR="$HERE/../rulesets"
 
-# nanotune is deliberately excluded until its coverage reaches 80 (decision
-# Q18); it sits at 71.6% with a 71 floor pinned in its caller workflow. Add it
-# here when nanotune#123 closes, and delete the pin in the same change.
-#
-# nanoterm was excluded on the same grounds and is no longer: it reached 90.56%
-# against the standard 80, so it joined the list on 2026-09-07.
-DEFAULT_REPOS="nanocoder sentinel prompt-scrubber get-md json-up nanoterm"
+# Every package repo is on the standard 80% coverage threshold as of
+# 2026-09-07. nanoterm (90.56%) and nanotune (80.7%, nanotune#173) were the last
+# two held out by decision Q18, and both cleared the bar — no repo carries a
+# pinned floor any more.
+DEFAULT_REPOS="nanocoder sentinel prompt-scrubber get-md json-up nanoterm nanotune"
 REPOS="${REPOS:-$DEFAULT_REPOS}"
 
 # RepositoryRole bypass actor ids, resolved empirically on 2026-09-04 via
