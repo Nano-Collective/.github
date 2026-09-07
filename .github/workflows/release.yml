@@ -91,6 +91,22 @@ on:
           until a stable version exists to claim it.
         type: boolean
         default: true
+    outputs:
+      # Exposed so a caller can hang its own jobs off the release — nanocoder
+      # updates a Nix flake and a Homebrew formula after publishing, and both
+      # need the version and whether anything actually shipped.
+      should-publish:
+        description: '"true" when this push published a new version.'
+        value: ${{ jobs.check-version.outputs.should-publish }}
+      package-version:
+        description: The version in package.json.
+        value: ${{ jobs.check-version.outputs.package-version }}
+      package-name:
+        description: The npm package name, read from package.json.
+        value: ${{ jobs.check-version.outputs.package-name }}
+      is-prerelease:
+        description: '"true" for an alpha, beta or rc version.'
+        value: ${{ jobs.check-version.outputs.is-prerelease }}
     secrets:
       NPM_TOKEN:
         required: true
