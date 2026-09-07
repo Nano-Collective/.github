@@ -54,6 +54,12 @@ jobs:
       issues: write
       pull-requests: write
     with:
+      # Only ever non-empty on workflow_dispatch, and that is deliberate.
+      # The shared workflow resolves the PR itself with
+      #   github.event.pull_request.number || github.event.issue.number || inputs.pr-number
+      # so pull_request_target and issue_comment are covered by the event, and
+      # this input is purely the manual-dispatch fallback. Do not duplicate that
+      # expression here — it would be the same logic in nine callers, drifting.
       pr-number: ${{ inputs.pr_number }}
       # Drop this line in a repo with no CLAUDE.md — or leave it, the shared
       # workflow omits an architecture doc it cannot find.
