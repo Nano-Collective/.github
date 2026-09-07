@@ -72,13 +72,32 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Create or update the Version Packages PR
-        # pin: changesets/action@v1.5.3
-        uses: changesets/action@e0145edc7d9d8679003495b11f87bd8ef63c0cba
+        # pin: changesets/action@v2.1.2
+        #
+        # v2 is required, not merely newer. v1 bundles `@changesets/read@0.6`,
+        # which still understands the Changesets v1 folder format — a changeset
+        # was a *directory* containing `changes.md`. Changesets v3 archives
+        # already-applied changesets into `.changeset/pre/` while a repo is in
+        # prerelease mode, and v1 of this action reads that archive directory as
+        # a legacy changeset and dies on the `changes.md` that isn't there.
+        #
+        # It fails before it runs the version script, so the symptom is a repo
+        # in pre mode whose *first* Version PR succeeds (no archive yet) and
+        # every one after it fails. v2.0.0 dropped the Changesets v1
+        # compatibility path, which is exactly the fix. It requires Changesets
+        # CLI v3, which every Nano Collective repo is on.
+        uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51
         with:
-          # `version:` only. No `publish:` input, so this action never runs
-          # `changeset publish` — release.yml owns publishing.
-          version: pnpm run ${{ inputs.version-script }}
-          title: ${{ inputs.pr-title }}
-          commit: ${{ inputs.pr-title }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # `version-script:` only. No `publish-script:` input, so this action
+          # never runs `changeset publish` — release.yml owns publishing.
+          version-script: pnpm run ${{ inputs.version-script }}
+          pr-title: ${{ inputs.pr-title }}
+          commit-message: ${{ inputs.pr-title }}
+          # v2 changed the default to pushing the release branch through the
+          # GitHub API. Keeping the Git CLI holds today's behaviour steady so
+          # this change fixes the reader and nothing else; moving to API pushes
+          # (which get signed, bot-attributed commits) is a separate decision.
+          push-with-git-cli: true
+        # No `GITHUB_TOKEN:` env — v2 removed it. `github-token` defaults to
+        # `${{ github.token }}`, and v2 *errors* if the env var is set to
+        # anything that disagrees with the input.
