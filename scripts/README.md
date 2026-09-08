@@ -76,6 +76,37 @@ exposed via **GraphQL** (`repositoryRoleName`), not REST.
 
 Re-run it if a bypass appears not to apply to the role you expected.
 
+## `extract-changelog.mjs`
+
+Prints one version's section of `CHANGELOG.md`, for the GitHub Release body.
+Invoked by the shared `release.yml`, which checks this repository out into
+`.nc-shared/` on the repo being released — so the script resolves paths from
+`process.cwd()`, not from its own location.
+
+```bash
+node scripts/extract-changelog.mjs            # version from package.json
+node scripts/extract-changelog.mjs 1.2.3      # explicit
+CHANGELOG_ROOT=../some-repo node scripts/extract-changelog.mjs
+```
+
+It lives here rather than in each package repo because it used to live in each
+package repo. Six of them carried the same two bugs, and the copies were only
+ever noticed when a seventh received one — CodeQL flags a copied file as new in
+the repo that receives it and as nothing at all in the ones that already had it.
+
+Both bugs are worth knowing about, because both were silent:
+
+- **Section boundaries were found with `(?=\n##+ )`**, which also matches
+  `###`. A changesets changelog opens every version with `### Patch Changes`, so
+  the capture terminated on the first line of the body, came back empty, and the
+  script exited `0` having printed nothing. **Every release body across every
+  repo was blank under "What's Changed"** until 2026-09-08. Boundaries are now
+  found by walking lines and comparing heading depth.
+- **The version was interpolated into a pattern with only `.` escaped**, so
+  `1.0.0(` threw `Invalid regular expression: Unterminated group` — failing a
+  release *after* the package was already on npm. The version is no longer put
+  into a pattern at all.
+
 ## Things the REST API cannot do
 
 Two organisation settings are **UI-only**. Both silently appear to succeed or
