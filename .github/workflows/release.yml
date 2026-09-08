@@ -65,11 +65,13 @@ on:
         default: 'dist/cli.js'
       changelog-script:
         description: >
-          Node script printing this version's changelog to stdout. Skipped when
-          the file is absent, in which case the release body says so rather than
-          failing.
+          Optional repo-local Node script printing this version's changelog to
+          stdout. Leave empty — the default — to use the shared extractor from
+          Nano-Collective/.github, which is what every repo should be doing: it
+          was copied per repo until 2026-09-08, which is how one flaw reached
+          six of them at once.
         type: string
-        default: 'scripts/extract-changelog.js'
+        default: ''
       release-name:
         description: >
           Display name for the GitHub Release, without the version. Defaults to
@@ -228,19 +230,44 @@ jobs:
           done
           echo "build output present: $FILES"
 
+      # Checked out after the build so nothing in it can reach the package, and
+      # into the workspace because actions/checkout requires that. Every repo
+      # publishes through a `files` allowlist, so it could not be packaged
+      # anyway.
+      - name: Checkout the shared scripts
+        # pin: actions/checkout@v4.3.1
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: Nano-Collective/.github
+          path: .nc-shared
+
       - name: Extract changelog
         id: changelog
         env:
           SCRIPT: ${{ inputs.changelog-script }}
         run: |
           set -uo pipefail
-          if [ -n "$SCRIPT" ] && [ -f "$SCRIPT" ] && OUT=$(node "$SCRIPT" 2>&1); then
+          # A repo-local script wins if one is configured and present; otherwise
+          # the shared extractor, which is the path every repo takes.
+          if [ -n "$SCRIPT" ] && [ -f "$SCRIPT" ]; then
+            EXTRACTOR="$SCRIPT"
+          else
+            EXTRACTOR=".nc-shared/scripts/extract-changelog.mjs"
+          fi
+
+          if OUT=$(node "$EXTRACTOR" 2>&1) && [ -n "$OUT" ]; then
             {
               echo "body<<CHANGELOG_EOF"
               echo "$OUT"
               echo "CHANGELOG_EOF"
             } >> "$GITHUB_OUTPUT"
           else
+            # Loud, not silent. Every release body between the first one and
+            # 2026-09-08 was empty under "What's Changed" because the extractor
+            # matched its version heading and then terminated the capture on the
+            # `### Patch Changes` immediately below it — exiting 0 with nothing
+            # on stdout. The workflow believed it and wrote a blank body.
+            echo "::warning::changelog extraction produced nothing (using $EXTRACTOR): ${OUT:-no output}"
             echo "body=No changelog available for this version." >> "$GITHUB_OUTPUT"
           fi
 
