@@ -99,9 +99,18 @@ Both bugs are worth knowing about, because both were silent:
 - **Section boundaries were found with `(?=\n##+ )`**, which also matches
   `###`. A changesets changelog opens every version with `### Patch Changes`, so
   the capture terminated on the first line of the body, came back empty, and the
-  script exited `0` having printed nothing. **Every release body across every
-  repo was blank under "What's Changed"** until 2026-09-08. Boundaries are now
-  found by walking lines and comparing heading depth.
+  script exited `0` having printed nothing.
+
+  **This hit any repo whose CHANGELOG.md is raw changesets output.** In practice
+  that was `sentinel`, whose release bodies were blank under "What's Changed"
+  until 2026-09-08. The others were spared by accident rather than design:
+  `nanocoder` post-processes its changelog into plain bullets, `get-md` and
+  `prompt-scrubber` hand-write theirs without a sub-heading directly under the
+  version, and `nanotune` links out to the file instead. Any of them adopting
+  the changesets default would have started producing empty release notes with
+  nothing to say so.
+
+  Boundaries are now found by walking lines and comparing heading depth.
 - **The version was interpolated into a pattern with only `.` escaped**, so
   `1.0.0(` threw `Invalid regular expression: Unterminated group` — failing a
   release *after* the package was already on npm. The version is no longer put
