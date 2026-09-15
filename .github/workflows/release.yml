@@ -271,6 +271,39 @@ jobs:
             echo "body=No changelog available for this version." >> "$GITHUB_OUTPUT"
           fi
 
+      # Credits every pull request author in the range, not just the ones a
+      # changeset happened to thank by hand — the people most worth naming are
+      # first-time contributors, who are the least likely to write their own
+      # thanks into their own changeset.
+      #
+      # Runs before the publish so a token or API failure is caught while the
+      # release can still be abandoned cheaply. It cannot fail the release
+      # either way: the script exits 0 and prints nothing when the list cannot
+      # be built, and the section is then omitted.
+      - name: Build the contributors section
+        id: contributors
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          # --target because the tag does not exist yet: it is created by the
+          # Create GitHub Release step below.
+          OUT=$(node .nc-shared/scripts/generate-contributors.mjs \
+            --tag "v${{ needs.check-version.outputs.package-version }}" \
+            --previous-tag "v${{ needs.check-version.outputs.npm-version }}" \
+            --target "${{ github.sha }}")
+          if [ -n "$OUT" ]; then
+            echo "contributors section built"
+          else
+            echo "no contributors section for this release"
+          fi
+          {
+            echo "body<<CONTRIBUTORS_EOF"
+            echo "$OUT"
+            echo "CONTRIBUTORS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Publish to NPM
         run: npm publish --provenance --access public --tag "${{ needs.check-version.outputs.npm-tag }}"
         env:
@@ -309,6 +342,7 @@ jobs:
           PREVIOUS: ${{ needs.check-version.outputs.npm-version }}
           INSTALL_TEMPLATE: ${{ inputs.install-command }}
           CHANGELOG: ${{ steps.changelog.outputs.body }}
+          CONTRIBUTORS: ${{ steps.contributors.outputs.body }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -320,6 +354,12 @@ jobs:
             echo
             echo "$CHANGELOG"
             echo
+            # Guarded rather than echoed unconditionally: an empty value would
+            # leave a stray blank line where the section would have been.
+            if [ -n "$CONTRIBUTORS" ]; then
+              echo "$CONTRIBUTORS"
+              echo
+            fi
             echo "### Install"
             echo
             echo '```bash'

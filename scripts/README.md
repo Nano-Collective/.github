@@ -116,6 +116,57 @@ Both bugs are worth knowing about, because both were silent:
   release *after* the package was already on npm. The version is no longer put
   into a pattern at all.
 
+## `generate-contributors.mjs`
+
+Prints the `### Contributors` section of a GitHub Release body. Invoked by the
+shared `release.yml` from `.nc-shared/`, same as the extractor above.
+
+```bash
+GITHUB_TOKEN=$(gh auth token) GITHUB_REPOSITORY=Nano-Collective/prompt-scrubber \
+  node scripts/generate-contributors.mjs --tag v1.4.0 --previous-tag v1.3.0
+```
+
+```
+### Contributors
+
+This release shipped thanks to @akramcodez.
+
+First-time contributors: @akramcodez. Welcome, and thank you!
+```
+
+It exists because the release body comes from `CHANGELOG.md`, which credits
+someone only when whoever wrote the changeset remembered to type *"Thanks to
+@someone"*. That makes the credit depend on a human remembering, and the people
+who most need crediting are first-time contributors, who are the least likely to
+write their own thanks into their own changeset. `prompt-scrub` v1.4.0 shipped
+one contributor's entire feature under a release body that named nobody.
+
+Rather than parse the git log, it asks GitHub's own release-notes generator
+(`POST /releases/generate-notes`) who authored the pull requests in the range,
+which is also where the first-time-contributor determination comes from.
+
+Two things worth knowing:
+
+- **It never fails a release.** Every failure path prints to stderr and exits
+  `0` with nothing on stdout; the workflow omits the section when the output is
+  empty. By the time the body is composed the package may already be on npm, and
+  a release must not be held up because the credits could not be built.
+- **The tag does not exist yet when it runs.** It is created by the step that
+  publishes the release, so `--target <sha>` supplies the commitish to resolve
+  the range against. `--previous-tag` is dropped when that tag is missing — a
+  first release, or a version published to npm without a matching tag — and the
+  generator picks the range itself.
+
+Bots are excluded two ways: a `[bot]` suffix falls outside the login character
+class so `@github-actions[bot]` never matches at all, and `BOT_LOGINS` covers
+the accounts that appear without the suffix.
+
+This was lifted from `nanocoder`, which had it as a repo-local script while the
+six repos on the shared workflow had nothing. `nanocoder` does not call the
+shared `release.yml` (it has its own, which publishes a VS Code extension and
+updates a Homebrew formula), so its copy stays where it is — but it is the same
+logic, and a fix to one should go to the other.
+
 ## Things the REST API cannot do
 
 Two organisation settings are **UI-only**. Both silently appear to succeed or
