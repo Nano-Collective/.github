@@ -92,6 +92,25 @@ on:
         description: NANOCODER_CONTEXT_LIMIT for the review run.
         type: string
         default: '128000'
+      max-output-tokens:
+        description: >
+          Cap on what the model may generate in a single turn.
+
+          This is NOT optional detail. @ai-sdk/anthropic reads the ceiling off
+          the model id and falls back to 4096 for anything that is not a known
+          Claude model, and `minimax-m3` is not one — so leaving this unset caps
+          every turn at 4096 tokens. A review that reasons before it acts hits
+          that mid-sentence and stops, having never called write_file, which is
+          precisely how runs ended with "could not produce a verdict".
+
+          Deliberately conservative. MiniMax's own documentation gives 131072 as
+          the recommended output limit, OpenRouter reports 262144 for the same
+          model, and the numbers do not agree across providers; an oversized
+          value is rejected outright by some endpoints rather than clamped. A
+          review verdict is a few thousand tokens, so there is nothing to buy by
+          going near any of those ceilings.
+        type: string
+        default: '32000'
       nanocoder-repo:
         description: >
           Where to build the Nanocoder runtime from. This is the agent that
@@ -471,7 +490,8 @@ jobs:
                   "sdkProvider": "${{ inputs.provider-sdk }}",
                   "baseUrl": "${{ inputs.provider-base-url }}",
                   "apiKey": "${MINIMAX_API_KEY}",
-                  "models": ["${{ inputs.model }}"]
+                  "models": ["${{ inputs.model }}"],
+                  "maxOutputTokens": ${{ inputs.max-output-tokens }}
                 }
               ]
             }
@@ -480,7 +500,12 @@ jobs:
           # Assert the key was not baked into the file.
           grep -q '\${MINIMAX_API_KEY}' agents.config.json \
             || { echo "::error::config must reference the key by name, not value"; exit 1; }
-          echo "provider configured; tools restricted to read + write_file"
+          # A missing ceiling is silent: the run does not fail, it just gets
+          # 4096 tokens a turn and dies mid-sentence. Cheaper to catch here than
+          # to read it back out of a truncated transcript.
+          jq -e '.nanocoder.providers[0].maxOutputTokens > 4096' agents.config.json >/dev/null \
+            || { echo "::error::maxOutputTokens missing or not above the 4096 fallback"; exit 1; }
+          echo "provider configured; max output tokens: ${{ inputs.max-output-tokens }}"
 
       - name: Run nc-review
         id: agent
