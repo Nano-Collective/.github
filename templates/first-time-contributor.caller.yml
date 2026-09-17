@@ -1,0 +1,62 @@
+name: First-Time Contributor Onboarding
+
+# Thin caller for the shared org workflow. All logic lives in
+# Nano-Collective/.github — change it there and every repo picks it up.
+#
+# ---------------------------------------------------------------------------
+# SECURITY: pull_request_target, and what this caller does NOT do
+# ---------------------------------------------------------------------------
+# The shared workflow needs PAT_TOKEN (a cross-repo write token), which the
+# `pull_request` event does not expose to fork PRs. `pull_request_target` does
+# expose secrets — at the cost of the well-known footgun where checking out
+# the PR head lets untrusted code run with a privileged token.
+#
+# This caller does not check out anything, and the shared workflow does not
+# either. The workflow only talks to the REST API. If you ever add an
+# `actions/checkout` step here, this caller stops being safe.
+#
+# ---------------------------------------------------------------------------
+# Required: PAT_TOKEN
+# ---------------------------------------------------------------------------
+# The shared workflow writes to a target repository. The default GITHUB_TOKEN
+# only reaches the calling repo, so a personal access token with `contents:
+# write` and `pull-requests: write` on the target repo is required. Set it
+# once as an ORGANISATION secret with visibility "all" — same pattern as
+# MINIMAX_API_KEY for nc-review.
+#
+# `pull_request_target` fires on close from forks, but with no check-out the
+# only workflow-file data the contributor can influence is the PR title,
+# body, branch name, and author login — all read via the event payload and
+# never executed.
+
+on:
+  pull_request_target:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # One onboarding run per PR. A second `closed` (e.g. via a forced push)
+  # queues behind the first — a duplicate onboarding attempt that wins the
+  # race would land twice.
+  group: first-time-contributor-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  first-time-contributor:
+    uses: Nano-Collective/.github/.github/workflows/first-time-contributor.yml@main
+    permissions:
+      contents: read
+      pull-requests: read
+    with:
+      # Override only when a repo points at a registry that is NOT
+      # Nano-Collective/.github. The default is right for every current
+      # package repo.
+      target-org-repo: 'Nano-Collective/.github'
+      target-file-path: 'contributors.json'
+    secrets:
+      PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
