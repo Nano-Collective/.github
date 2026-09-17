@@ -1,0 +1,584 @@
+name: Duplicate Issue Check
+
+# Shared duplicate-issue detector. Reads a freshly-opened issue, compares it
+# against recent open issues in the same repository, and applies a `duplicate`
+# label with a comment pointing at the original if one is found.
+#
+# The reasoning is delegated to the same Nanocoder runtime used by nc-review,
+# so contributors (and future maintainers) only have to understand one workflow
+# pattern. Where this differs from nc-review:
+#
+#   * The "diff" is the issue body — a paragraph or two, not a multi-thousand
+#     line patch. Context assembly is correspondingly cheaper.
+#   * There is no pull_request_target / fork concern. The trigger is `issues`,
+#     the body is fetched via the REST API, and we never check out the
+#     repository. The PR-diff security footnote in nc-review does not apply.
+#   * The verdict schema is small: `duplicate_of`, `summary`, `confidence`.
+#     Issue triage is one judgement, not eight.
+#
+# Callers wire it up with:
+#
+#   on:
+#     issues:
+#       types: [opened, edited]
+#     names: templates/duplicate-issue.caller.yml
+#
+# `edited` is in scope deliberately. People do edit the second file of a typo
+# conversation into a real report, and a bot that only looks at the first draft
+# would miss the better comparison.
+#
+# ---------------------------------------------------------------------------
+# Why this is here rather than copied into each repo
+# ---------------------------------------------------------------------------
+# Seven repos were about to receive seven near-identical copies, the way they
+# already received seven near-identical copies of `pr-checks.yml` before that
+# became a reusable workflow. Each copy drifted by one or two steps; the drift
+# was only ever noticed when a new repo received it. The whole point of the
+# `.github` repo is to make that pattern stop, and there is no reason for an
+# issue-triage bot to be different.
+#
+# ---------------------------------------------------------------------------
+# Cost
+# ---------------------------------------------------------------------------
+# One model call per opened or edited issue. On a repo with twenty issues a
+# week that is twenty model calls. The model call is the only meaningful cost;
+# Nanocoder builds from `main` once per run, the same way nc-review does. A repo
+# that wants to skip the build can override the `nanocoder-repo` input to a
+# pre-installed binary, but the cold-start build is what every other shared
+# workflow does today, and changing it here would diverge for no documented
+# reason.
+
+on:
+  workflow_call:
+    inputs:
+      issue-number:
+        description: >
+          Issue to check when the caller was triggered by workflow_dispatch.
+          Ignored for `issues` events, which carry the number in the payload.
+        type: string
+        default: ''
+      open-issues-limit:
+        description: >
+          How many recent open issues to compare against. GitHub's search index
+          caps this in practice; the bot's accuracy falls off as the new issue's
+          true duplicate falls outside the window.
+        type: number
+        default: 100
+      similarity-hint:
+        description: >
+          Free-form hint the model sees as part of its context. Used to point
+          it at project-specific signals (e.g. "this repo uses 'get-md' to mean
+          'Markdown to Markdown', not 'GET /md'"). Keep it short.
+        type: string
+        default: ''
+      model:
+        description: Model id to triage with.
+        type: string
+        default: 'minimax-m3'
+      provider-name:
+        description: Display name for the provider block.
+        type: string
+        default: 'MiniMax Coding'
+      provider-base-url:
+        description: Provider base URL.
+        type: string
+        default: 'https://api.minimax.io/anthropic/v1'
+      provider-sdk:
+        description: Nanocoder sdkProvider to speak to the endpoint with.
+        type: string
+        default: 'anthropic'
+      context-limit:
+        description: NANOCODER_CONTEXT_LIMIT for the triage run.
+        type: string
+        default: '32000'
+      max-output-tokens:
+        description: >
+          Cap on what the model may generate in a single turn.
+
+          Same reason as nc-review: @ai-sdk/anthropic reads the ceiling off the
+          model id and falls back to 4096 for anything that is not a known
+          Claude model, and `minimax-m3` is not one — so leaving this unset
+          caps every turn at 4096 tokens. The verdict is small, so a
+          deliberately conservative ceiling is enough.
+        type: string
+        default: '8000'
+      nanocoder-repo:
+        description: >
+          Where to build the Nanocoder runtime from. The agent that performs
+          the triage, not the repository being triaged.
+        type: string
+        default: 'https://github.com/Nano-Collective/nanocoder.git'
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        default: 10
+    secrets:
+      MINIMAX_API_KEY:
+        description: >
+          API key for the triage model. Set it once as an organisation secret
+          with visibility "all" rather than per repo — organisation Actions
+          secrets are available to public repositories on the Free plan
+          (verified 2026-09-07).
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  # One triage per issue. An `edited` while `opened` is still running queues
+  # behind it — the second pass will see the first pass's label, and a stale
+  # duplicate claim is worse than a delayed one.
+  group: duplicate-issue-${{ github.event.issue.number || inputs.issue-number }}
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    # Skip the bot's own labels and dependency tracks, which produce a lot of
+    # near-duplicate noise that a human would never want flagged.
+    if: |
+      (
+        github.event_name == 'issues'
+        && github.event.action == 'opened'
+      ) || (
+        github.event_name == 'issues'
+        && github.event.action == 'edited'
+        && github.event.changes.body != null
+      ) || github.event_name == 'workflow_dispatch'
+
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+
+    steps:
+      - name: Resolve issue number
+        id: issue
+        env:
+          N: ${{ github.event.issue.number || inputs.issue-number }}
+        run: echo "number=$N" >> "$GITHUB_OUTPUT"
+
+      # Filter out the obvious non-targets before spending a model call. The
+      # bot's author check covers issue templates that pre-populate the body —
+      # those would re-trigger on every save — and the label check covers a
+      # previous run that already made the call. `pull_request` linked issues
+      # never arrive here: they live on the PR, not as issues.
+      - name: Skip if not worth checking
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          N: ${{ steps.issue.outputs.number }}
+        run: |
+          set -euo pipefail
+          JSON=$(gh issue view "$N" --json author,labels,state 2>/dev/null || echo '{}')
+          AUTHOR=$(echo "$JSON" | jq -r '.author.login // empty')
+          STATE=$(echo "$JSON" | jq -r '.state // empty')
+          HAS_DUP=$(echo "$JSON" | jq -r '[.labels[].name] | any(. == "duplicate")')
+          IS_BOT=$(echo "$JSON" | jq -r '.author.is_bot // true')
+          if [ -z "$AUTHOR" ] || [ "$STATE" != "OPEN" ]; then
+            echo "skip: issue not retrievable or not open (author=$AUTHOR state=$STATE)"
+            exit 0
+          fi
+          if [ "$HAS_DUP" = "true" ]; then
+            echo "skip: issue already labelled duplicate"
+            exit 0
+          fi
+          if [ "$IS_BOT" = "true" ]; then
+            echo "skip: author is a bot ($AUTHOR)"
+            exit 0
+          fi
+
+      - name: Assemble triage context
+        id: ctx
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          N: ${{ steps.issue.outputs.number }}
+          LIMIT: ${{ inputs.open-issues-limit }}
+          HINT: ${{ inputs.similarity-hint }}
+        run: |
+          set -euo pipefail
+
+          # No `actions/checkout` step on purpose. There is nothing on disk to
+          # need — the new issue and the corpus are fetched through the API,
+          # written into /tmp, and read by Nanocoder from the working directory
+          # we set up below. Pulling the repository would be doing work for no
+          # reason and would also make this step match nc-review's footgun
+          # surface (see the security note there) for no benefit.
+          mkdir -p .nc-triage
+
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          NAME="${GITHUB_REPOSITORY##*/}"
+
+          # The new issue. The body is untrusted text written by the person
+          # who opened the issue. The model reads it as data — no tool execution
+          # path exists for it.
+          gh issue view "$N" --json number,title,body,author,createdAt \
+            --repo "$GITHUB_REPOSITORY" \
+            > .nc-triage/issue.json
+
+          # The comparison corpus. Only OPEN issues — anything closed has
+          # already been judged, and pointing them at a closed issue would be a
+          # "this was already resolved" message rather than a duplicate label.
+          # The `--limit` mirrors nc-review's open-PR limit; accuracy falls off
+          # past it and there's no documented way to widen it from the API.
+          gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit "$LIMIT" \
+            --json number,title,author,createdAt,labels \
+            | jq --argjson me "$N" 'map(select(.number != $me))' \
+            > .nc-triage/corpus.json 2>/dev/null || echo '[]' > .nc-triage/corpus.json
+
+          # Pull the bodies separately — `gh issue list --json body` is capped
+          # at 300 bytes per body and silently truncates the rest. A bug report
+          # that gets truncated is a duplicate-detection corpus with a hole
+          # exactly where the actual description was. Pulling them in full
+          # keeps the model from being asked to compare against a paragraph
+          # that ends with "see …".
+          N_CORPUS=$(jq 'length' .nc-triage/corpus.json)
+          echo "comparison corpus: $N_CORPUS open issues"
+          if [ "$N_CORPUS" -gt 0 ]; then
+            jq -r '.[].number' .nc-triage/corpus.json | while read -r NUM; do
+              BODY=$(gh issue view "$NUM" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""')
+              printf '%s\t%s\n' "$NUM" "$BODY"
+            done > .nc-triage/bodies.tsv
+          else
+            : > .nc-triage/bodies.tsv
+          fi
+
+          OUT=.nc-triage/context.md
+          {
+            echo "# Issue triage — duplicate detection"
+            echo
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Issue number: #$N"
+            echo
+            echo "## How to read this"
+            echo
+            echo "You are deciding whether the issue below is a duplicate of any of"
+            echo "the open issues in the comparison corpus."
+            echo
+            echo "- **Duplicate** means: same underlying problem, same fix would"
+            echo "  close both. A new report of an old bug is a duplicate even if"
+            echo "  worded differently; a related-but-distinct problem is not."
+            echo "- **Not a duplicate** is the default. A wrong duplicate claim"
+            echo "  sends someone to read an unrelated thread, costs trust, and"
+            echo "  gets harder to undo the longer it sits."
+            echo "- If the new issue is itself a tracking issue for several"
+            echo "  distinct reports, the closest single match is enough."
+            echo
+            echo "If you cannot tell, set duplicate_of to null. 'Could not tell'"
+            echo "is a better answer than a confident wrong one."
+            echo
+            if [ -n "$HINT" ]; then
+              echo "## Project hint"
+              echo
+              echo "$HINT"
+              echo
+            fi
+            echo "## New issue"
+            echo
+            echo '```json'
+            jq '{number, title, author: .author.login, createdAt}' .nc-triage/issue.json
+            echo '```'
+            echo
+            echo '```markdown'
+            jq -r '.body // "(no body provided)"' .nc-triage/issue.json
+            echo '```'
+            echo
+            echo "## Comparison corpus — $N_CORPUS open issues"
+            echo
+            if [ "$N_CORPUS" -eq 0 ]; then
+              echo "No other open issues to compare against."
+            else
+              echo "Each entry has a number, title, author, and full body. Read the"
+              echo "bodies before judging — titles alone are not enough."
+              echo
+              while IFS=$'\t' read -r NUM BODY; do
+                [ -z "$NUM" ] && continue
+                META=$(jq --argjson n "$NUM" '.[] | select(.number == $n)' .nc-triage/corpus.json)
+                echo "### #$NUM — $(echo "$META" | jq -r '.title')"
+                echo
+                echo "Author: @$(echo "$META" | jq -r '.author.login // "(unknown)"') · Opened: $(echo "$META" | jq -r '.createdAt')"
+                echo "Labels: $(echo "$META" | jq -r '[.labels[].name] | join(", ") // "(none)"')"
+                echo
+                if [ -n "$BODY" ]; then
+                  echo "$BODY"
+                else
+                  echo "_(no body)_"
+                fi
+                echo
+              done < .nc-triage/bodies.tsv
+            fi
+          } > "$OUT"
+
+          echo "context bytes: $(wc -c < "$OUT")"
+
+      - name: Ensure labels exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "duplicate"      --color "cfd3d7" --description "Identified as a duplicate of another issue" --force
+          gh label create "agent:duplicate-uncertain" --color "fbca04" --description "Duplicate check ran but was not confident enough to label" --force
+
+      # Nanocoder resolves providers from `agents.config.json` in the working
+      # directory first. Same trick as nc-review — written at run time so it
+      # does not contaminate the calling repository, and the key is referenced
+      # by name so it never appears in the file or in any echoed output.
+      #
+      # disabledTools is the allowlist-by-subtraction a reviewer noted on
+      # nc-review: the triage task needs to read one file and write one JSON
+      # verdict. Everything else is off. fetch_url would let untrusted issue
+      # bodies steer the model toward a malicious host; execute_bash would
+      # let it escape the project directory entirely. string_replace,
+      # diff_edit and file_op are off because the triage has no business
+      # editing code — the diff/issue gate is exactly what this comment is
+      # trying to keep separate from code review.
+      - name: Build Nanocoder from main
+        env:
+          NANOCODER_REPO: ${{ inputs.nanocoder-repo }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "${NANOCODER_REPO}" /tmp/nanocoder
+          cd /tmp/nanocoder
+          npm install
+          npm run build
+          npm link
+          nanocoder --version || true
+
+      - name: Configure Nanocoder provider
+        run: |
+          set -euo pipefail
+          cat > agents.config.json <<JSON
+          {
+            "nanocoder": {
+              "disabledTools": [
+                "execute_bash",
+                "fetch_url",
+                "agent",
+                "ask_user",
+                "string_replace",
+                "diff_edit",
+                "file_op",
+                "write_plan",
+                "write_walkthrough",
+                "git_add",
+                "git_branch",
+                "git_commit",
+                "git_diff",
+                "git_log",
+                "git_pr",
+                "git_pull",
+                "git_push",
+                "git_reset",
+                "git_stash",
+                "git_status"
+              ],
+              "providers": [
+                {
+                  "name": "${{ inputs.provider-name }}",
+                  "sdkProvider": "${{ inputs.provider-sdk }}",
+                  "baseUrl": "${{ inputs.provider-base-url }}",
+                  "apiKey": "\${MINIMAX_API_KEY}",
+                  "models": ["${{ inputs.model }}"],
+                  "maxOutputTokens": ${{ inputs.max-output-tokens }}
+                }
+              ]
+            }
+          }
+          JSON
+          grep -q '\${MINIMAX_API_KEY}' agents.config.json \
+            || { echo "::error::config must reference the key by name, not value"; exit 1; }
+          jq -e '.nanocoder.providers[0].maxOutputTokens > 4096' agents.config.json >/dev/null \
+            || { echo "::error::maxOutputTokens missing or not above the 4096 fallback"; exit 1; }
+
+      - name: Run duplicate check
+        id: agent
+        env:
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          NANOCODER_CONTEXT_LIMIT: ${{ inputs.context-limit }}
+        run: |
+          set -euo pipefail
+          SCHEMA='{
+            "duplicate_of": 123,
+            "summary": "One or two sentences: why this is or is not a duplicate, and which issue it matches.",
+            "confidence": "high | medium | low"
+          }'
+
+          PROMPT='You are triaging a GitHub issue for duplicate detection. Read .nc-triage/context.md.
+
+          YOUR ONLY DELIVERABLE IS THE FILE .nc-triage/verdict.json — write it with write_file. Use exactly these keys, spelled exactly this way. Every key is required:
+
+          '"$SCHEMA"'
+
+          - duplicate_of: integer issue number, or null. Only set it when you can point at a specific issue from the corpus.
+          - summary: one or two sentences. What you compared, what you concluded, why.
+          - confidence: "high" only when the same fix would close both; "medium" when it is the same problem area but the fix might differ; "low" when you are guessing.
+
+          Anything you write in chat is discarded and never reaches a human. Only the JSON file is read.
+
+          You are not finished until write_file has succeeded on .nc-triage/verdict.json. If you have triaged the issue but not yet written that file, write it now.'
+
+          set +e
+          nanocoder run "$PROMPT" \
+            --mode yolo \
+            --model "${{ inputs.model }}" \
+            --trust-directory
+          STATUS=$?
+          set -e
+
+          # Normalise and validate. A verdict that parses as JSON is not
+          # necessarily a verdict — the model can produce well-formed JSON
+          # using key names it reconstructed from memory (the same failure
+          # mode nc-review hit on #978). The normalisation below accepts the
+          # handful of near-miss key names so a real triage is not binned over
+          # a synonym, then validates the result against the schema. Anything
+          # that fails is treated as no verdict at all.
+          usable_verdict() {
+            [ -s .nc-triage/verdict.json ] || return 1
+            jq -e . .nc-triage/verdict.json >/dev/null 2>&1 || return 1
+
+            jq '
+              def nz: if type == "string" and (gsub("^\\s+|\\s+$"; "") | length) > 0
+                      then . else null end;
+              def conf:
+                (if type == "string" then ascii_downcase | gsub("[^a-z]"; "") else "" end) as $s
+                | if   ["high","certain","confident"]      | index($s) then "high"
+                  elif ["medium","med"]                    | index($s) then "medium"
+                  elif ["low","uncertain","unsure","maybe"] | index($s) then "low"
+                  else null end;
+              {
+                duplicate_of: (
+                  if   (.duplicate_of | type) == "number" then .duplicate_of
+                  elif (.duplicate_of // .duplicateOf // .duplicate | type) == "number"
+                       then (.duplicate_of // .duplicateOf // .duplicate)
+                  else null end
+                ),
+                summary: ((.summary | nz) // (.reasoning | nz) // (.reason | nz) // "(no summary)"),
+                confidence: ((.confidence | conf) // (.conf | conf))
+              }
+            ' .nc-triage/verdict.json > .nc-triage/verdict.normalised.json 2>/dev/null || {
+              rm -f .nc-triage/verdict.normalised.json; return 1;
+            }
+
+            # All three keys must be present after normalisation. `duplicate_of`
+            # may be null (legitimate: not a duplicate); `summary` and
+            # `confidence` must always be there.
+            jq -e '
+              (.duplicate_of == null or (.duplicate_of | type == "number"))
+              and (.summary | type == "string" and length > 0)
+              and (.confidence == "high" or .confidence == "medium" or .confidence == "low")
+            ' .nc-triage/verdict.normalised.json >/dev/null 2>&1 || {
+              rm -f .nc-triage/verdict.normalised.json; return 1;
+            }
+          }
+
+          # Keep the rejected verdict where the next person can see it.
+          dump_rejected() {
+            [ -s .nc-triage/verdict.json ] || return 0
+            {
+              echo "### duplicate-issue: verdict rejected as malformed"
+              echo
+              echo 'Raw `.nc-triage/verdict.json`, first 100 lines:'
+              echo
+              echo '```json'
+              head -n 100 .nc-triage/verdict.json
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          # One retry, same reasoning as nc-review: a second attempt is ~3
+          # minutes, and "the analysis was good and went nowhere" is an
+          # expensive way to fail. Back off first to dodge the rate-limit case
+          # nc-review hit.
+          if ! usable_verdict; then
+            echo "::warning::no usable verdict after first attempt — retrying once"
+            dump_rejected
+            sleep 60
+            RETRY='Read .nc-triage/context.md, then write your triage verdict as a single JSON object to .nc-triage/verdict.json using write_file. Use exactly these keys, spelled exactly this way. Every key is required:
+
+            '"$SCHEMA"'
+
+            Write the file. Do not reply in chat — chat output is discarded and only the file is read. The file is the entire task.'
+            set +e
+            nanocoder run "$RETRY" \
+              --mode yolo \
+              --model "${{ inputs.model }}" \
+              --trust-directory
+            STATUS=$?
+            set -e
+            if usable_verdict; then
+              echo "retry produced a usable verdict"
+            else
+              echo "::warning::retry also produced no usable verdict"
+              dump_rejected
+            fi
+          fi
+
+          echo "agent_status=$STATUS" >> "$GITHUB_OUTPUT"
+
+      # The downstream steps read the NORMALISED verdict, not the raw one. The
+      # normalised file only exists if the previous step validated the model's
+      # output against the schema, so every field read below is guaranteed to
+      # be present and of the right type.
+      - name: Apply duplicate label and comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          N: ${{ steps.issue.outputs.number }}
+          AGENT_STATUS: ${{ steps.agent.outputs.agent_status }}
+        run: |
+          set -euo pipefail
+          V=.nc-triage/verdict.normalised.json
+
+          # No verdict means the model failed — that is the workflow's fault,
+          # not the contributor's. Comment so a maintainer can re-run, but do
+          # not label.
+          if [ ! -s "$V" ] || ! jq -e . "$V" >/dev/null 2>&1; then
+            echo "::warning::no usable verdict (agent exit ${AGENT_STATUS:-unknown})"
+            gh issue comment "$N" --body \
+              "**duplicate-issue** could not produce a verdict this run (agent exit \`${AGENT_STATUS:-unknown}\`). This is a problem with the triage agent, not with your issue. A maintainer can re-run with \`workflow_dispatch\`." \
+              || true
+            exit 0
+          fi
+
+          DUP=$(jq -r '.duplicate_of // empty' "$V")
+          SUMMARY=$(jq -r '.summary // "No summary provided."' "$V")
+          CONF=$(jq -r '.confidence // "low"' "$V")
+
+          # No duplicate. Drop a `agent:duplicate-uncertain` label when the
+          # model was unsure — that's the case a maintainer most wants to
+          # skim — and otherwise do nothing. Labelling everything
+          # `agent:clean` would be noise; the absence of a label means "the
+          # bot looked and did not see a match".
+          if [ -z "$DUP" ] || [ "$DUP" = "null" ]; then
+            if [ "$CONF" = "low" ]; then
+              gh issue edit "$N" --add-label "agent:duplicate-uncertain" || true
+            fi
+            echo "no duplicate found (confidence: $CONF)"
+            exit 0
+          fi
+
+          # Verify the duplicate target exists and is still open. The
+          # comparison corpus was built at the start of the run; an issue
+          # could have closed in the meantime, and labelling a closure as a
+          # duplicate is wrong twice over.
+          TARGET_STATE=$(gh issue view "$DUP" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
+          if [ "$TARGET_STATE" != "OPEN" ]; then
+            echo "duplicate target #$DUP is $TARGET_STATE; skipping label"
+            gh issue comment "$N" --body \
+              "**duplicate-issue** noticed a similarity but the candidate original (#$DUP) is now $TARGET_STATE, so this is not being labelled as a duplicate. A maintainer can re-run with \`workflow_dispatch\`." \
+              || true
+            exit 0
+          fi
+
+          {
+            echo "### duplicate-issue: possible duplicate of #$DUP"
+            echo
+            echo "$SUMMARY"
+            echo
+            echo "Confidence: **$CONF**."
+            echo
+            echo "If this is the same problem and #$DUP is the right original, leave the \`duplicate\` label in place and the issue will be closed by a maintainer."
+            echo
+            echo "If this is a different problem, remove the label — a wrong duplicate claim sends people to read an unrelated thread and costs trust."
+            echo
+            echo "<sub>Automated duplicate check. The comparison corpus was the repository's other open issues at the time of the run; a duplicate outside that window cannot be detected. A human still decides.</sub>"
+          } > /tmp/comment.md
+
+          gh issue comment "$N" --body-file /tmp/comment.md
+          gh issue edit "$N" --add-label "duplicate"
