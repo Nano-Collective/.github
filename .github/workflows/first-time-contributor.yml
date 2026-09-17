@@ -1,0 +1,490 @@
+name: First-Time Contributor Onboarding
+
+# Opens a PR in a target organisation repository that adds the merged-PR's
+# author to a contributor list. Intended to be called by every package
+# repository when a contributor's first PR lands.
+#
+# Idempotent along four axes:
+#
+#   1. Bot authors are skipped (GitHub's `is_bot` field — matches by class, not
+#     by a `[bot]` suffix, so `copilot-swe-agent` etc. are excluded).
+#   2. Authors with any prior merged PR in the organisation are skipped
+#     (GitHub search API, query: `type:pr author:USERNAME org:ORG is:merged`).
+#   3. Authors already present in the contributor list are skipped.
+#   4. Authors with an open onboarding PR in the target repo are skipped.
+#
+# Each skip is a normal `exit 0` with a reason in the step summary — the run
+# never fails a workflow because there was nothing to do.
+#
+# ---------------------------------------------------------------------------
+# SECURITY: why pull_request_target, and why that is safe here
+# ---------------------------------------------------------------------------
+# Opening a PR in a *different* repository needs a token that has write access
+# there, and `pull_request` does not expose secrets to fork PRs.
+# `pull_request_target` runs in the base repository's context with the base
+# repo's secrets — but it has the well-known footgun of exposing untrusted
+# code to a privileged token if you check out the PR head.
+#
+# This workflow never does. Specifically:
+#
+#   1. No `actions/checkout` step. The contributor's branch is never on disk.
+#   2. The PR body, title, and author come from the REST API — text data,
+#      never code that runs.
+#   3. No `pnpm install`, `npm install`, or any other dependency step touches
+#      PR-authored lockfiles or scripts.
+#
+# If you ever add a step that checks out `github.event.pull_request.head.sha`
+# or installs from the PR, this workflow becomes a credential-theft vector.
+# Do not.
+#
+# ---------------------------------------------------------------------------
+# Required token
+# ---------------------------------------------------------------------------
+# Cross-repo writes need a token whose access is not limited to the calling
+# repository. PAT_TOKEN is required — without it the run exits cleanly and
+# logs the reason. The org-wide PAT currently used by update-badges.yml is
+# the natural candidate. A future `APP_TOKEN` from a fine-grained GitHub App
+# would be cleaner; the secret name stays the same so swapping is a one-line
+# change here.
+
+on:
+  workflow_call:
+    inputs:
+      target-org-repo:
+        description: >
+          Organisation repository that holds the contributor list. The
+          default is the shared `.github` repo, which already houses the
+          profile README and shared workflows — a natural home for a
+          central registry.
+        type: string
+        default: 'Nano-Collective/.github'
+      target-file-path:
+        description: >
+          Path inside the target repository to the contributor list. Default
+          is a flat JSON array — see the file-format note above the workflow
+          body for the schema. Repos that want a markdown registry can point
+          this at a `.md` file and configure `format: markdown`, but JSON
+          is the only format tested here.
+        type: string
+        default: 'contributors.json'
+      target-base-branch:
+        description: Branch in the target repo to base the onboarding PR on.
+        type: string
+        default: 'main'
+      branch-prefix:
+        description: >
+          Prefix for the onboarding branch in the target repo. Combined with
+          the contributor's login and the source PR number to keep branches
+          distinct for repeat contributors. Default is `contrib/`.
+        type: string
+        default: 'contrib/'
+      pr-title-template:
+        description: >
+          Title for the onboarding PR. `{login}` is replaced with the
+          contributor's GitHub login and `{source}` with `owner/repo#number`.
+        type: string
+        default: 'chore: add @{login} to contributors ({source})'
+      search-org:
+        description: >
+          Organisation whose prior merged PRs count against first-timer
+          status. Defaults to the owner of the calling repo (i.e. the same
+          organisation the target repo lives in). Override only when a repo
+          lives under a different org than its contributors registry.
+        type: string
+        default: ''
+      search-author-prs-limit:
+        description: >
+          Maximum number of prior merged PRs to scan before declaring the
+          author a first-timer. GitHub search caps at 1000, and the bot only
+          needs to find *one* to disqualify — this is purely a sanity bound.
+        type: number
+        default: 100
+    secrets:
+      PAT_TOKEN:
+        description: >
+          Token with `contents: write` and `pull-requests: write` on the
+          target org repo. The org-wide PAT currently used by update-badges.yml
+          is the natural choice.
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  # One onboarding run per merged PR. A re-run queues behind the first; a
+  # duplicate onboarding attempt that wins the race would land twice.
+  group: first-time-contributor-${{ github.event.pull_request.number || inputs.target-org-repo }}
+  cancel-in-progress: false
+
+jobs:
+  onboard:
+    # `pull_request_target` events so PAT_TOKEN is available on fork PRs;
+    # filtered to actual merges here. The `workflow_dispatch` path is for
+    # backfilling a missed contributor manually and bypasses the merge check.
+    if: |
+      (
+        github.event_name == 'pull_request_target'
+        && github.event.pull_request.merged == true
+        && github.event.pull_request.head.ref != 'changeset-release/main'
+      ) || github.event_name == 'workflow_dispatch'
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Resolve author
+        id: author
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # workflow_dispatch has no event payload, so the manual backfill
+          # path requires the caller to pass author info through dispatch
+          # inputs — out of scope for the first cut, so dispatch exits here.
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "skip: workflow_dispatch backfill path is not in scope yet"
+            echo "ignored=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          AUTHOR=$(jq -r '.pull_request.user.login // empty' "$GITHUB_EVENT_PATH")
+          AUTHOR_ID=$(jq -r '.pull_request.user.id // empty' "$GITHUB_EVENT_PATH")
+          AUTHOR_TYPE=$(jq -r '.pull_request.user.type // "User"' "$GITHUB_EVENT_PATH")
+          PR_URL=$(jq -r '.pull_request.html_url // empty' "$GITHUB_EVENT_PATH")
+          PR_NUMBER=$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")
+          PR_MERGED_AT=$(jq -r '.pull_request.merged_at // empty' "$GITHUB_EVENT_PATH")
+
+          if [ -z "$AUTHOR" ] || [ -z "$AUTHOR_ID" ]; then
+            echo "skip: PR has no resolvable author"
+            echo "ignored=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Bot filter. `type == "Bot"` is the GitHub-canonical signal and
+          # covers every account GitHub itself labels a bot, including those
+          # without the `[bot]` suffix (dependabot, renovate, copilot).
+          if [ "$AUTHOR_TYPE" = "Bot" ]; then
+            echo "skip: author @$AUTHOR is a bot account"
+            echo "ignored=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "login=$AUTHOR"
+            echo "pr_url=$PR_URL"
+            echo "pr_number=$PR_NUMBER"
+            echo "pr_merged_at=$PR_MERGED_AT"
+            echo "ignored=false"
+          } >> "$GITHUB_OUTPUT"
+
+      # Fetch the GitHub profile (`avatar_url`, `name`, `bio`, `html_url`,
+      # `blog`, `company`, `twitter_username`). Public endpoint, but
+      # authenticated requests get 5000 req/hr instead of 60. A failure here
+      # is non-fatal — the entry falls back to login-only — because a
+      # contributor with no profile snapshot is still worth recording.
+      - name: Fetch GitHub profile
+        id: profile
+        if: steps.author.outputs.ignored != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOGIN: ${{ steps.author.outputs.login }}
+        run: |
+          set -euo pipefail
+          PROFILE=$(gh api "users/${LOGIN}" --jq '{
+            login: .login,
+            name: (.name // null),
+            bio: (.bio // null),
+            avatar_url: .avatar_url,
+            html_url: .html_url,
+            blog: (.blog // null),
+            company: (.company // null),
+            twitter_username: (.twitter_username // null)
+          }' 2>/dev/null || echo 'null')
+          if [ -z "$PROFILE" ] || [ "$PROFILE" = "null" ]; then
+            echo "warning: profile fetch returned empty for @$LOGIN; using login-only entry"
+            PROFILE='null'
+          fi
+          {
+            echo "profile<<EOF"
+            echo "$PROFILE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # All idempotency skips live in one script so the step summary shows
+      # exactly which one fired. Order matters: cheapest checks first,
+      # because the search call is the most expensive step in this workflow.
+      - name: Compute the work, or exit cleanly
+        id: plan
+        if: steps.author.outputs.ignored != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          TARGET_REPO: ${{ inputs.target-org-repo }}
+          TARGET_FILE: ${{ inputs.target-file-path }}
+          TARGET_BASE_BRANCH: ${{ inputs.target-base-branch }}
+          BRANCH_PREFIX: ${{ inputs.branch-prefix }}
+          PR_TITLE_TEMPLATE: ${{ inputs.pr-title-template }}
+          SEARCH_ORG_INPUT: ${{ inputs.search-org }}
+          SEARCH_LIMIT: ${{ inputs.search-author-prs-limit }}
+          AUTHOR: ${{ steps.author.outputs.login }}
+          PR_URL: ${{ steps.author.outputs.pr_url }}
+          SOURCE_NUMBER: ${{ steps.author.outputs.pr_number }}
+          SOURCE_MERGED_AT: ${{ steps.author.outputs.pr_merged_at }}
+          PROFILE_JSON: ${{ steps.profile.outputs.profile }}
+          SOURCE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          SOURCE_REF="${SOURCE_REPO}#${SOURCE_NUMBER}"
+
+          SEARCH_ORG="${SEARCH_ORG_INPUT:-${SOURCE_REPO%%/*}}"
+          echo "first-timer scope: organisation '$SEARCH_ORG'"
+
+          # First-timer check: any prior merged PR by this author in the org?
+          # GitHub search caps at 1000 results and one is enough to disqualify,
+          # so we ask for one result. If the source PR itself shows up, we
+          # exclude it — otherwise the first PR ever would always disqualify.
+          Q="type:pr+author:${AUTHOR}+org:${SEARCH_ORG}+is:merged"
+          HITS=$(gh api --header "Accept: application/vnd.github+json" \
+            "search/issues?q=${Q}&per_page=2" \
+            --jq '.items // [] | map({number: .number, repo_url: .repository_url})') || HITS='[]'
+          PRIOR=$(echo "$HITS" | jq --arg repo "${SOURCE_REPO}" \
+            --argjson n "${SOURCE_NUMBER}" \
+            '[.[] | select(.repo_url != "https://api.github.com/repos/\($repo)" or .number != $n)] | length')
+          if [ "$PRIOR" -gt 0 ]; then
+            echo "skip: @$AUTHOR already has $PRIOR merged PR(s) in $SEARCH_ORG"
+            echo "ignored = true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Contributor-list read. The target repo is in a different org/
+          # repo from the workflow's context, so it needs PAT_TOKEN, not
+          # GITHUB_TOKEN — the default token only reaches the current repo.
+          # A 404 means the file does not exist yet, which is fine — we'll
+          # create it. Any other failure is treated as a hard skip so a
+          # transient target-repo outage does not block the first PR.
+          CONTRIB_JSON=""
+          if FILE_B64=$(gh api \
+              -H "Authorization: Bearer ${PAT_TOKEN}" \
+              "repos/${TARGET_REPO}/contents/${TARGET_FILE}?ref=${TARGET_BASE_BRANCH}" \
+              --jq '.content // empty' 2>/dev/null); then
+            if [ -n "$FILE_B64" ]; then
+              CONTRIB_JSON=$(printf '%s' "$FILE_B64" | base64 -d | tr -d '\r')
+            fi
+          else
+            RC=$?
+            if [ "$RC" -ne 0 ]; then
+              echo "skip: could not read ${TARGET_REPO}/${TARGET_FILE} (rc=$RC)"
+              echo "ignored = true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          # Normalise to an array even if the file is empty or absent. A
+          # malformed file (not a JSON array) is treated as a skip, not a
+          # failure — overwriting a hand-edited file would be worse than
+          # silently failing to onboard this contributor.
+          if [ -z "$CONTRIB_JSON" ]; then
+            CONTRIB_JSON='[]'
+          fi
+          if ! echo "$CONTRIB_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            echo "skip: ${TARGET_REPO}/${TARGET_FILE} is not a JSON array"
+            echo "ignored = true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Already in list?
+          ALREADY=$(echo "$CONTRIB_JSON" | jq --arg login "$AUTHOR" \
+            '[.[] | select(.github == $login)] | length')
+          if [ "$ALREADY" -gt 0 ]; then
+            echo "skip: @$AUTHOR already in ${TARGET_REPO}/${TARGET_FILE}"
+            echo "ignored = true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Open onboarding PR in target repo? Searches for the branch name
+          # the workflow would create — a manual backfill using a different
+          # name would still create a duplicate, but the chance of collision
+          # there is low and the alternative is a name-based heuristic that
+          # is harder to keep correct.
+          BRANCH_NAME="${BRANCH_PREFIX}${AUTHOR//\//-}-${SOURCE_NUMBER}"
+          OPEN_PRS=$(gh api --header "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${PAT_TOKEN}" \
+            "repos/${TARGET_REPO}/pulls?state=open&head=${TARGET_REPO%%/*}:${BRANCH_NAME}&per_page=1" \
+            --jq 'length' 2>/dev/null || echo 0)
+          if [ "${OPEN_PRS:-0}" -gt 0 ]; then
+            echo "skip: open onboarding PR for @$AUTHOR already exists"
+            echo "ignored = true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Plan resolved. Persist it to outputs so the next step does not
+          # have to re-derive any of it.
+          #
+          # The entry shape mirrors the fields the website's Contributor type
+          # already exposes (`name`, `bio`, `photo`, `github`, `website`), so
+          # the JSON can be a source-of-truth for either a manual update to
+          # lib/contributors.ts or a future refactor that has the page read
+          # the JSON directly. `photo` here is the GitHub `avatar_url` —
+          # committed local photos stay a separate concern; the workflow
+          # does not write binary assets.
+          ENTRY=$(jq -n \
+            --arg login "$AUTHOR" --arg url "$PR_URL" \
+            --arg repo "$SOURCE_REPO" --argjson number "$SOURCE_NUMBER" \
+            --arg merged "$SOURCE_MERGED_AT" \
+            --argjson profile "${PROFILE_JSON:-null}" '
+            {
+              github: $login,
+              profile: {
+                login: ($profile.login // $login),
+                name: ($profile.name // null),
+                bio: ($profile.bio // null),
+                avatar_url: ($profile.avatar_url // null),
+                html_url: ($profile.html_url // null),
+                blog: ($profile.blog // null),
+                company: ($profile.company // null),
+                twitter_username: ($profile.twitter_username // null)
+              },
+              first_pr: {
+                repo: $repo,
+                number: $number,
+                url: $url,
+                merged_at: $merged
+              }
+            }')
+
+          NEW_FILE=$(echo "$CONTRIB_JSON" | jq \
+            --argjson entry "$ENTRY" \
+            --arg login "$AUTHOR" \
+            '. + [$entry] | sort_by(.github | ascii_downcase)')
+
+          PR_TITLE=${PR_TITLE_TEMPLATE//\{login\}/$AUTHOR}
+          PR_TITLE=${PR_TITLE//\{source\}/$SOURCE_REF}
+
+          {
+            echo "login=$AUTHOR"          >> "$GITHUB_OUTPUT"
+            echo "branch=$BRANCH_NAME"    >> "$GITHUB_OUTPUT"
+            echo "pr_title=$PR_TITLE"     >> "$GITHUB_OUTPUT"
+            echo "entry=$ENTRY"           >> "$GITHUB_OUTPUT"
+            echo "new_file<<EOF"          >> "$GITHUB_OUTPUT"
+            echo "$NEW_FILE"              >> "$GITHUB_OUTPUT"
+            echo "EOF"                    >> "$GITHUB_OUTPUT"
+            echo "ignored=false"          >> "$GITHUB_OUTPUT"
+          }
+
+      # The plan step exits 0 on every skip and on every success. A non-zero
+      # status here means the plan failed mid-computation — re-throw and let
+      # the workflow surface it as a failed run.
+      - name: Create the onboarding branch, file, and PR
+        if: steps.plan.outputs.ignored != 'true'
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          TARGET_REPO: ${{ inputs.target-org-repo }}
+          TARGET_FILE: ${{ inputs.target-file-path }}
+          TARGET_BASE_BRANCH: ${{ inputs.target-base-branch }}
+          LOGIN: ${{ steps.plan.outputs.login }}
+          BRANCH_NAME: ${{ steps.plan.outputs.branch }}
+          PR_TITLE: ${{ steps.plan.outputs.pr_title }}
+          NEW_FILE: ${{ steps.plan.outputs.new_file }}
+          ENTRY: ${{ steps.plan.outputs.entry }}
+          SOURCE_REPO: ${{ github.repository }}
+          SOURCE_NUMBER: ${{ github.event.pull_request.number }}
+          AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+
+          OWNER="${TARGET_REPO%%/*}"
+          HEAD_SHA=$(gh api \
+            -H "Authorization: Bearer ${PAT_TOKEN}" \
+            "repos/${TARGET_REPO}/git/ref/heads/${TARGET_BASE_BRANCH}" \
+            --jq '.object.sha')
+          echo "base: ${TARGET_REPO}@${TARGET_BASE_BRANCH} (${HEAD_SHA:0:7})"
+
+          # Branch off the base. If a stale branch from a previous run exists,
+          # force-update it — every successful plan produces the same file,
+          # so the result is identical and re-running is safe. (No re-run
+          # should reach this step: the open-PR check above would have caught
+          # it. This is belt-and-braces for branches left over from a partial
+          # failure.)
+          if gh api \
+              -H "Authorization: Bearer ${PAT_TOKEN}" \
+              -X POST \
+              "repos/${TARGET_REPO}/git/refs" \
+              -f "ref=refs/heads/${BRANCH_NAME}" \
+              -f "sha=${HEAD_SHA}" >/dev/null 2>&1; then
+            echo "branch created"
+          else
+            gh api \
+              -H "Authorization: Bearer ${PAT_TOKEN}" \
+              -X PATCH \
+              "repos/${TARGET_REPO}/git/refs/heads/${BRANCH_NAME}" \
+              -f "sha=${HEAD_SHA}" \
+              -f "force=true" >/dev/null
+            echo "branch updated (was stale)"
+          fi
+
+          # File content. Read back the existing file's blob SHA so we can
+          # update it in place; an empty SHA means the file does not yet
+          # exist and we're creating it. (The plan step already verified the
+          # file is either absent or a valid JSON array.)
+          BLOB_SHA=""
+          if EXISTING=$(gh api \
+              -H "Authorization: Bearer ${PAT_TOKEN}" \
+              "repos/${TARGET_REPO}/contents/${TARGET_FILE}?ref=${BRANCH_NAME}" \
+              --jq '.sha // empty' 2>/dev/null); then
+            BLOB_SHA="$EXISTING"
+          fi
+
+          COMMIT_MSG="chore: add @${LOGIN} to contributors (onboarding from ${SOURCE_REPO}#${SOURCE_NUMBER})"
+          COMMIT_BODY=$(printf '%s' "$NEW_FILE" | base64 -w 0)
+          if [ -n "$BLOB_SHA" ]; then
+            gh api \
+              -H "Authorization: Bearer ${PAT_TOKEN}" \
+              -X PUT \
+              "repos/${TARGET_REPO}/contents/${TARGET_FILE}" \
+              -f "message=${COMMIT_MSG}" \
+              -f "content=${COMMIT_BODY}" \
+              -f "sha=${BLOB_SHA}" \
+              -f "branch=${BRANCH_NAME}" >/dev/null
+          else
+            gh api \
+              -H "Authorization: Bearer ${PAT_TOKEN}" \
+              -X PUT \
+              "repos/${TARGET_REPO}/contents/${TARGET_FILE}" \
+              -f "message=${COMMIT_MSG}" \
+              -f "content=${COMMIT_BODY}" \
+              -f "branch=${BRANCH_NAME}" >/dev/null
+          fi
+
+          # The PR. Body is plain markdown; the only machine-readable field
+          # is the JSON entry, embedded so a maintainer can copy it back
+          # without re-running the workflow if the file ever needs manual
+          # editing.
+          PR_BODY=$(cat <<EOF
+          Onboards @$LOGIN, who just had their first pull request merged into
+          a Nano Collective repository: ${SOURCE_REPO}#${SOURCE_NUMBER}.
+
+          Entry added:
+
+          \`\`\`json
+          $ENTRY
+          \`\`\`
+
+          This PR was opened automatically by the
+          [first-time-contributor workflow](https://github.com/Nano-Collective/.github).
+          Approve and merge to record @$LOGIN as a Nano Collective contributor.
+          EOF
+          )
+
+          gh api \
+            -H "Authorization: Bearer ${PAT_TOKEN}" \
+            -X POST \
+            "repos/${TARGET_REPO}/pulls" \
+            -f "title=${PR_TITLE}" \
+            -f "head=${BRANCH_NAME}" \
+            -f "base=${TARGET_BASE_BRANCH}" \
+            -f "body=${PR_BODY}" >/dev/null
+
+          echo "onboarding PR opened for @$LOGIN"
