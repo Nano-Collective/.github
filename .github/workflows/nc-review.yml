@@ -209,8 +209,15 @@ jobs:
           set -euo pipefail
           git clone --depth 1 "${NANOCODER_REPO}" /tmp/nanocoder
           cd /tmp/nanocoder
-          npm install
-          npm run build
+          # Must be pnpm, not npm: Nanocoder declares `patchedDependencies` in
+          # pnpm-workspace.yaml, and npm silently ignores them. Without the
+          # patches the build fails to typecheck against the patched `ink`
+          # types, and any binary that did build would be missing the runtime
+          # behaviour those patches add. `--frozen-lockfile` is safe here —
+          # this is a clone of `main`, never the PR branch (see the note at the
+          # top of this file).
+          pnpm install --frozen-lockfile
+          pnpm run build
           npm link
           nanocoder --version || true
 
