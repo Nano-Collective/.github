@@ -264,22 +264,35 @@ jobs:
           # keeps the model from being asked to compare against a paragraph
           # that ends with "see …".
           #
-          # NDJSON, not TSV: issue bodies are multi-line prose, so a tab-
-          # separated file breaks the read loop the moment a body contains a
-          # newline (the loop then feeds prose to --argjson and dies). One
-          # JSON object per line survives any body content, and the consumer
-          # below re-parses with jq rather than IFS-splitting.
+          # One batched GraphQL call, not one REST call per issue. 100 open
+          # issues used to mean 100 sequential round-trips per triaged issue;
+          # GraphQL aliases fetch every body in a single request. Aliases are
+          # prefixed `i` (GraphQL alias names must match /[_A-Za-z][_0-9A-Za-z]*/
+          # and cannot start with a digit). Bodies can exceed any sane argument
+          # size if passed through the shell, so the response is filtered to
+          # NDJSON with jq — one JSON object per line, which survives any
+          # body content and is re-parsed below rather than IFS-split.
           N_CORPUS=$(jq 'length' .nc-triage/corpus.json)
           echo "comparison corpus: $N_CORPUS open issues"
           : > .nc-triage/bodies.ndjson
           if [ "$N_CORPUS" -gt 0 ]; then
-            jq -c '.[]' .nc-triage/corpus.json | while read -r META_LINE; do
-              NUM=$(echo "$META_LINE" | jq -r '.number')
-              BODY=$(gh issue view "$NUM" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""')
-              # -c keeps the emitted line single-line regardless of newlines
-              # inside the body itself.
-              jq -cn --argjson n "$NUM" --arg body "$BODY" '{number: $n, body: $body}'
-            done > .nc-triage/bodies.ndjson
+            ALIASES=$(jq -r 'to_entries | map("i\(.key): issue(number: \(.value.number)) { number body }") | join(" ")' .nc-triage/corpus.json)
+            GRAPHQL="{repository(owner: \"$OWNER\", name: \"$NAME\") { $ALIASES }}"
+            gh api graphql \
+              -f query="$GRAPHQL" \
+              --jq '.data.repository | to_entries[] | {number: .value.number, body: (.value.body // "")}' \
+              > .nc-triage/bodies.ndjson 2>/dev/null \
+            || {
+              # Fallback: the REST path. If the batched call fails (rate
+              # limit, payload size), fall back to per-issue REST rather
+              # than triaging against an empty corpus.
+              echo "::warning::batched body fetch failed; falling back to per-issue REST"
+              jq -c '.[]' .nc-triage/corpus.json | while read -r META_LINE; do
+                NUM=$(echo "$META_LINE" | jq -r '.number')
+                BODY=$(gh issue view "$NUM" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""')
+                jq -cn --argjson n "$NUM" --arg body "$BODY" '{number: $n, body: $body}'
+              done > .nc-triage/bodies.ndjson
+            }
           fi
 
           OUT=.nc-triage/context.md
