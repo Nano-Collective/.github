@@ -43,6 +43,14 @@ on:
           keeps current on main.
         type: boolean
         default: true
+      coverage-drop-tolerance:
+        description: >-
+          Percentage points of coverage a PR may lose against the base branch
+          before fail-on-coverage-drop trips. Absorbs rounding noise, where a
+          well-tested change still moves the total by a hundredth of a point.
+          coverage-threshold remains the absolute floor.
+        type: number
+        default: 1
       verify-build:
         description: 'Run the Verify Build job. Disable for repos with no build step.'
         type: boolean
@@ -253,6 +261,7 @@ jobs:
         env:
           THRESHOLD: ${{ inputs.coverage-threshold }}
           FAIL_ON_DROP: ${{ inputs.fail-on-coverage-drop }}
+          DROP_TOLERANCE: ${{ inputs.coverage-drop-tolerance }}
           BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
@@ -279,6 +288,9 @@ jobs:
           # Drift against the base branch. The baseline comes from the committed
           # coverage badge, which update-badges.yml refreshes on main. A repo
           # without the badge yet simply skips this check rather than failing.
+          # The comparison allows a tolerance band, because an exact `<` fails a
+          # PR over a hundredth of a point of rounding. coverage-threshold above
+          # is the real floor, so drift can never accumulate past it.
           BASELINE=""
           if [ "${FAIL_ON_DROP}" = "true" ]; then
             git fetch --no-tags --depth=1 origin "${BASE_REF}" || true
@@ -292,9 +304,12 @@ jobs:
             if [ -n "${BASELINE}" ]; then
               echo "baseline=${BASELINE}" >> "$GITHUB_OUTPUT"
               echo "Baseline coverage on ${BASE_REF}: ${BASELINE}%"
-              if awk "BEGIN {exit !(${COVERAGE} < ${BASELINE})}"; then
-                echo "::error::Coverage dropped from ${BASELINE}% to ${COVERAGE}%"
+              FLOOR=$(awk "BEGIN {printf \"%.2f\", ${BASELINE} - ${DROP_TOLERANCE}}")
+              if awk "BEGIN {exit !(${COVERAGE} < ${FLOOR})}"; then
+                echo "::error::Coverage dropped from ${BASELINE}% to ${COVERAGE}%, more than the ${DROP_TOLERANCE}pp tolerance allows"
                 FAILED=1
+              elif awk "BEGIN {exit !(${COVERAGE} < ${BASELINE})}"; then
+                echo "::notice::Coverage dipped from ${BASELINE}% to ${COVERAGE}%, within the ${DROP_TOLERANCE}pp tolerance"
               fi
             else
               echo "::notice::No coverage baseline on ${BASE_REF}; drift check skipped"
@@ -308,6 +323,7 @@ jobs:
             echo "|---|---|"
             echo "| This PR | ${COVERAGE} |"
             echo "| Baseline (\`${BASE_REF}\`) | ${BASELINE:-n/a} |"
+            echo "| Drift tolerance | ${DROP_TOLERANCE} |"
             echo "| Threshold | ${THRESHOLD} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
