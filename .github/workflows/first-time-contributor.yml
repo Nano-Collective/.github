@@ -114,7 +114,11 @@ permissions:
 concurrency:
   # One onboarding run per merged PR. A re-run queues behind the first; a
   # duplicate onboarding attempt that wins the race would land twice.
-  group: first-time-contributor-${{ github.event.pull_request.number || inputs.target-org-repo }}
+  #
+  # The callee group name deliberately differs from the caller's
+  # (`first-time-contributor-${{ github.event.pull_request.number }}`): with
+  # identical names the callee can queue behind its own caller.
+  group: first-time-contributor-callee-${{ github.event.pull_request.number || inputs.target-org-repo }}
   cancel-in-progress: false
 
 jobs:
@@ -255,7 +259,7 @@ jobs:
             '[.[] | select(.repo_url != "https://api.github.com/repos/\($repo)" or .number != $n)] | length')
           if [ "$PRIOR" -gt 0 ]; then
             echo "skip: @$AUTHOR already has $PRIOR merged PR(s) in $SEARCH_ORG"
-            echo "ignored = true" >> "$GITHUB_OUTPUT"
+            echo "ignored=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -277,7 +281,7 @@ jobs:
             RC=$?
             if [ "$RC" -ne 0 ]; then
               echo "skip: could not read ${TARGET_REPO}/${TARGET_FILE} (rc=$RC)"
-              echo "ignored = true" >> "$GITHUB_OUTPUT"
+              echo "ignored=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
           fi
@@ -291,7 +295,7 @@ jobs:
           fi
           if ! echo "$CONTRIB_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
             echo "skip: ${TARGET_REPO}/${TARGET_FILE} is not a JSON array"
-            echo "ignored = true" >> "$GITHUB_OUTPUT"
+            echo "ignored=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -300,7 +304,7 @@ jobs:
             '[.[] | select(.github == $login)] | length')
           if [ "$ALREADY" -gt 0 ]; then
             echo "skip: @$AUTHOR already in ${TARGET_REPO}/${TARGET_FILE}"
-            echo "ignored = true" >> "$GITHUB_OUTPUT"
+            echo "ignored=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -316,7 +320,7 @@ jobs:
             --jq 'length' 2>/dev/null || echo 0)
           if [ "${OPEN_PRS:-0}" -gt 0 ]; then
             echo "skip: open onboarding PR for @$AUTHOR already exists"
-            echo "ignored = true" >> "$GITHUB_OUTPUT"
+            echo "ignored=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -367,7 +371,15 @@ jobs:
             echo "login=$AUTHOR"          >> "$GITHUB_OUTPUT"
             echo "branch=$BRANCH_NAME"    >> "$GITHUB_OUTPUT"
             echo "pr_title=$PR_TITLE"     >> "$GITHUB_OUTPUT"
-            echo "entry=$ENTRY"           >> "$GITHUB_OUTPUT"
+            # entry is a pretty-printed multi-line JSON object. A bare
+            # `entry=$ENTRY` embeds raw newlines and the runner rejects the
+            # output file with "Unable to process file command 'output':
+            # Invalid format" — the same reason new_file below already uses
+            # the heredoc-delimiter form. This is what silently killed every
+            # success-path run before the fix.
+            echo "entry<<EOF"             >> "$GITHUB_OUTPUT"
+            echo "$ENTRY"                 >> "$GITHUB_OUTPUT"
+            echo "EOF"                    >> "$GITHUB_OUTPUT"
             echo "new_file<<EOF"          >> "$GITHUB_OUTPUT"
             echo "$NEW_FILE"              >> "$GITHUB_OUTPUT"
             echo "EOF"                    >> "$GITHUB_OUTPUT"
@@ -421,7 +433,7 @@ jobs:
               -X PATCH \
               "repos/${TARGET_REPO}/git/refs/heads/${BRANCH_NAME}" \
               -f "sha=${HEAD_SHA}" \
-              -f "force=true" >/dev/null
+              -F "force=true" >/dev/null
             echo "branch updated (was stale)"
           fi
 

@@ -90,7 +90,10 @@ on:
       context-limit:
         description: NANOCODER_CONTEXT_LIMIT for the triage run.
         type: string
-        default: '32000'
+        # 32000 overflowed with 100 full issue bodies and autoCompact started
+        # eating the output schema — the exact failure mode nc-review
+        # documents. Match nc-review's 128000.
+        default: '128000'
       max-output-tokens:
         description: >
           Cap on what the model may generate in a single turn.
@@ -129,7 +132,13 @@ concurrency:
   # One triage per issue. An `edited` while `opened` is still running queues
   # behind it — the second pass will see the first pass's label, and a stale
   # duplicate claim is worse than a delayed one.
-  group: duplicate-issue-${{ github.event.issue.number || inputs.issue-number }}
+  #
+  # Deliberately NOT the same group name the caller uses (`duplicate-issue-…`
+  # scoped to the calling repo). Caller and callee share one runner pool per
+  # repo, and identical group names make the callee queue behind the caller
+  # waiting on it — a dead-lock-shaped delay on every run. The callee suffix
+  # keeps the two distinct while preserving the per-issue serialization.
+  group: duplicate-issue-callee-${{ github.event.issue.number || inputs.issue-number }}
   cancel-in-progress: false
 
 jobs:
@@ -149,6 +158,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
+    # gh does not read GITHUB_REPOSITORY — every `gh issue view` / `gh label
+    # create` / `gh issue comment` call below is repo-scoped through this one
+    # env assignment rather than a --repo flag repeated (and eventually
+    # dropped) on each call. Mirrors what nc-review does per-call; a job-level
+    # env is less repetitive and cannot drift.
+    env:
+      GH_REPO: ${{ github.repository }}
+
     steps:
       - name: Resolve issue number
         id: issue
@@ -161,32 +178,49 @@ jobs:
       # those would re-trigger on every save — and the label check covers a
       # previous run that already made the call. `pull_request` linked issues
       # never arrive here: they live on the PR, not as issues.
+      #
+      # This step cannot just `exit 0` on a skip: that ends the step, not the
+      # job. Every downstream step is gated on `steps.skip.outputs.skip` —
+      # a skip here writes skip=true and the rest of the job is a no-op.
       - name: Skip if not worth checking
+        id: skip
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           N: ${{ steps.issue.outputs.number }}
         run: |
           set -euo pipefail
           JSON=$(gh issue view "$N" --json author,labels,state 2>/dev/null || echo '{}')
+
+          # `// empty` on a missing object fails loudly below; `{} // {}` is a
+          # no-op, so guard explicitly. `.labels` on `{}` is null and
+          # `null[]` iterates to nothing, so `[.labels[]?]` yields [] — no
+          # "Cannot iterate over null" crash.
           AUTHOR=$(echo "$JSON" | jq -r '.author.login // empty')
           STATE=$(echo "$JSON" | jq -r '.state // empty')
-          HAS_DUP=$(echo "$JSON" | jq -r '[.labels[].name] | any(. == "duplicate")')
-          IS_BOT=$(echo "$JSON" | jq -r '.author.is_bot // true')
+          HAS_DUP=$(echo "$JSON" | jq -r '[.labels[]? | .name] | any(. == "duplicate")')
+          # jq's `//` fires on false as well as null, so `.author.is_bot // true`
+          # misclassifies every human author as a bot. Test explicitly instead.
+          IS_BOT=$(echo "$JSON" | jq -r 'if (.author.is_bot == null) or (.author.is_bot == false) then "false" else "true" end')
           if [ -z "$AUTHOR" ] || [ "$STATE" != "OPEN" ]; then
             echo "skip: issue not retrievable or not open (author=$AUTHOR state=$STATE)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$HAS_DUP" = "true" ]; then
             echo "skip: issue already labelled duplicate"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$IS_BOT" = "true" ]; then
             echo "skip: author is a bot ($AUTHOR)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
 
       - name: Assemble triage context
         id: ctx
+        if: steps.skip.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           N: ${{ steps.issue.outputs.number }}
@@ -229,15 +263,23 @@ jobs:
           # exactly where the actual description was. Pulling them in full
           # keeps the model from being asked to compare against a paragraph
           # that ends with "see …".
+          #
+          # NDJSON, not TSV: issue bodies are multi-line prose, so a tab-
+          # separated file breaks the read loop the moment a body contains a
+          # newline (the loop then feeds prose to --argjson and dies). One
+          # JSON object per line survives any body content, and the consumer
+          # below re-parses with jq rather than IFS-splitting.
           N_CORPUS=$(jq 'length' .nc-triage/corpus.json)
           echo "comparison corpus: $N_CORPUS open issues"
+          : > .nc-triage/bodies.ndjson
           if [ "$N_CORPUS" -gt 0 ]; then
-            jq -r '.[].number' .nc-triage/corpus.json | while read -r NUM; do
+            jq -c '.[]' .nc-triage/corpus.json | while read -r META_LINE; do
+              NUM=$(echo "$META_LINE" | jq -r '.number')
               BODY=$(gh issue view "$NUM" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""')
-              printf '%s\t%s\n' "$NUM" "$BODY"
-            done > .nc-triage/bodies.tsv
-          else
-            : > .nc-triage/bodies.tsv
+              # -c keeps the emitted line single-line regardless of newlines
+              # inside the body itself.
+              jq -cn --argjson n "$NUM" --arg body "$BODY" '{number: $n, body: $body}'
+            done > .nc-triage/bodies.ndjson
           fi
 
           OUT=.nc-triage/context.md
@@ -288,13 +330,22 @@ jobs:
               echo "Each entry has a number, title, author, and full body. Read the"
               echo "bodies before judging — titles alone are not enough."
               echo
-              while IFS=$'\t' read -r NUM BODY; do
-                [ -z "$NUM" ] && continue
+              # bodies.ndjson is the NDJSON produced above: one JSON object per
+              # line, safe for a line-oriented read loop regardless of what the
+              # issue body contains.
+              while read -r LINE; do
+                [ -z "$LINE" ] && continue
+                NUM=$(echo "$LINE" | jq -r '.number')
+                BODY=$(echo "$LINE" | jq -r '.body // ""')
                 META=$(jq --argjson n "$NUM" '.[] | select(.number == $n)' .nc-triage/corpus.json)
                 echo "### #$NUM — $(echo "$META" | jq -r '.title')"
                 echo
                 echo "Author: @$(echo "$META" | jq -r '.author.login // "(unknown)"') · Opened: $(echo "$META" | jq -r '.createdAt')"
-                echo "Labels: $(echo "$META" | jq -r '[.labels[].name] | join(", ") // "(none)"')"
+                # join() on an empty array returns "", which jq treats as truthy,
+                # so `join(", ") // "(none)"` can never reach the fallback. Build
+                # the string and test it instead.
+                LABELS=$(echo "$META" | jq -r '[.labels[]? | .name] | if length == 0 then "(none)" else join(", ") end')
+                echo "Labels: $LABELS"
                 echo
                 if [ -n "$BODY" ]; then
                   echo "$BODY"
@@ -302,13 +353,14 @@ jobs:
                   echo "_(no body)_"
                 fi
                 echo
-              done < .nc-triage/bodies.tsv
+              done < .nc-triage/bodies.ndjson
             fi
           } > "$OUT"
 
           echo "context bytes: $(wc -c < "$OUT")"
 
       - name: Ensure labels exist
+        if: steps.skip.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -328,7 +380,18 @@ jobs:
       # diff_edit and file_op are off because the triage has no business
       # editing code — the diff/issue gate is exactly what this comment is
       # trying to keep separate from code review.
+      # Nanocoder declares engines: {"node": ">=22"}. The ubuntu-latest image
+      # ships an older default node, and npm install fails its engines check on
+      # it. Same pin as nc-review: setup-node@v4, node 22.
+      - name: Set up Node
+        if: steps.skip.outputs.skip != 'true'
+        # pin: actions/setup-node@v4.4.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+
       - name: Build Nanocoder from main
+        if: steps.skip.outputs.skip != 'true'
         env:
           NANOCODER_REPO: ${{ inputs.nanocoder-repo }}
         run: |
@@ -341,9 +404,14 @@ jobs:
           nanocoder --version || true
 
       - name: Configure Nanocoder provider
+        if: steps.skip.outputs.skip != 'true'
         run: |
           set -euo pipefail
-          cat > agents.config.json <<JSON
+          # Quoted heredoc, same as nc-review. The \$ escape below is what keeps
+          # ${MINIMAX_API_KEY} literal at write time; with an unquoted <<JSON,
+          # any future $ or backtick in the provider name or similarity hint
+          # would be expanded by the shell before it reached the file.
+          cat > agents.config.json <<'JSON'
           {
             "nanocoder": {
               "disabledTools": [
@@ -373,7 +441,7 @@ jobs:
                   "name": "${{ inputs.provider-name }}",
                   "sdkProvider": "${{ inputs.provider-sdk }}",
                   "baseUrl": "${{ inputs.provider-base-url }}",
-                  "apiKey": "\${MINIMAX_API_KEY}",
+                  "apiKey": "${MINIMAX_API_KEY}",
                   "models": ["${{ inputs.model }}"],
                   "maxOutputTokens": ${{ inputs.max-output-tokens }}
                 }
@@ -388,6 +456,7 @@ jobs:
 
       - name: Run duplicate check
         id: agent
+        if: steps.skip.outputs.skip != 'true'
         env:
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
           NANOCODER_CONTEXT_LIMIT: ${{ inputs.context-limit }}
@@ -515,8 +584,13 @@ jobs:
       # normalised file only exists if the previous step validated the model's
       # output against the schema, so every field read below is guaranteed to
       # be present and of the right type.
+      #
+      # `always()` plus an explicit skip check rather than a bare skip-gate:
+      # when the run was skipped upstream there is no verdict at all, and the
+      # "no verdict" branch below would otherwise post a confusing failure
+      # comment on issues the workflow deliberately did not look at.
       - name: Apply duplicate label and comment
-        if: always()
+        if: always() && steps.skip.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           N: ${{ steps.issue.outputs.number }}
@@ -528,6 +602,10 @@ jobs:
           # No verdict means the model failed — that is the workflow's fault,
           # not the contributor's. Comment so a maintainer can re-run, but do
           # not label.
+          #
+          # The summary below is model-authored text derived from an untrusted
+          # issue body. It is length-capped and fenced so it can neither run
+          # away as a wall of text nor present itself as workflow output.
           if [ ! -s "$V" ] || ! jq -e . "$V" >/dev/null 2>&1; then
             echo "::warning::no usable verdict (agent exit ${AGENT_STATUS:-unknown})"
             gh issue comment "$N" --body \
@@ -538,6 +616,10 @@ jobs:
 
           DUP=$(jq -r '.duplicate_of // empty' "$V")
           SUMMARY=$(jq -r '.summary // "No summary provided."' "$V")
+          # Cap the model-authored summary: the issue body it derives from is
+          # untrusted, and an uncapped echo of it is a maintainer-looking
+          # comment with arbitrary length and content.
+          SUMMARY=$(printf '%s' "$SUMMARY" | head -c 1000)
           CONF=$(jq -r '.confidence // "low"' "$V")
 
           # No duplicate. Drop a `agent:duplicate-uncertain` label when the
@@ -569,7 +651,11 @@ jobs:
           {
             echo "### duplicate-issue: possible duplicate of #$DUP"
             echo
+            echo 'The triage agent summarised the match as:'
+            echo
+            echo '```'
             echo "$SUMMARY"
+            echo '```'
             echo
             echo "Confidence: **$CONF**."
             echo

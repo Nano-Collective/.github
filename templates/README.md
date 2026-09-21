@@ -1,7 +1,7 @@
 # Reusable workflow callers
 
 Each file here is a thin caller for a shared workflow that lives in
-[`.github/workflows/`](../workflows/). The shared workflows carry the
+[`.github/workflows/`](../.github/workflows/). The shared workflows carry the
 implementation; the callers carry only the trigger wiring and any
 project-specific overrides. Adopting a shared workflow in a new repository
 is a copy-and-edit of the matching caller.
@@ -99,3 +99,25 @@ The workflow exits cleanly (no PR opened) when any of these are true:
 Re-running a `pull_request_target: closed` workflow on the same PR is safe:
 each check above reads fresh data and the plan-then-write pattern means a
 second successful run produces an identical result.
+
+## Known limitations
+
+- **Write race on `contributors.json`.** The plan-then-write sequence reads
+  the file, computes the new contents, and pushes the result in a separate
+  commit. Two onboarding runs for different contributors that interleave
+  inside that window can each commit a version that omits the other's entry;
+  the second commit does not include the first. The open-PR and
+  already-in-list checks only protect against the *same* contributor being
+  added twice, not against concurrent writes by different ones. In practice
+  first-merged-PR events are rare enough that the window is unlikely to be
+  hit, but if it ever matters, the fix is a single-writer queue (e.g. the
+  onboarding PRs are the serialization — one open onboarding PR at a time,
+  reconciled from the live file on each run) or moving the write behind a
+  GitHub App with merge queuing.
+- **Search indexing latency.** The first-timer check uses the GitHub search
+  API, whose index lags live events. A contributor's very first merged PR
+  may not be visible to a search that runs minutes later, so a second PR
+  merged in quick succession can still be treated as a first contribution —
+  the "already in list" guard only catches that after the first onboarding
+  PR has actually merged into `contributors.json`. Worth knowing when
+  backfilling manually.
