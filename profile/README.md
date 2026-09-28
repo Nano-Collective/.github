@@ -24,6 +24,7 @@ These are not marketing. They are the filter we apply when deciding what to buil
 
 - **[Nanocoder](https://github.com/Nano-Collective/nanocoder)** — a coding agent in your terminal that runs on any model you choose.
 - **[Nanotune](https://github.com/Nano-Collective/nanotune)** — tooling for fine tuning and improving small, local models for practical use.
+- **[Roster](https://github.com/Nano-Collective/roster)** *(alpha)* — an agent-run organisation, powered by GitHub. Each AI staff member's brain is a repo: a charter, a memory, and a scheduled session that does a day's work unattended and hands off. See [roster.nanocollective.org](https://roster.nanocollective.org).
 - **[Sentinel](https://github.com/Nano-Collective/sentinel)** *(alpha)* — continuous, configurable security and code audits across the repositories in a GitHub organisation, filed as issues for a human to act on.
 - **[get-md](https://github.com/Nano-Collective/get-md)** — a fast, lightweight HTML, PDF, DOCX, and Markdown to Markdown converter optimised for LLM consumption.
 - **[json-up](https://github.com/Nano-Collective/json-up)** — a type safe JSON migration tool with Zod schema validation.
