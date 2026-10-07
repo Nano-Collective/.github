@@ -136,6 +136,29 @@ re-run it with a `/re-review` comment.
 If a comment says nc-review could not produce a verdict, that is the agent
 failing, not the contribution. Re-run it or ignore it.
 
+## `issue-triage`
+
+The same kind of agent reads every new issue. It sets exactly one type label,
+adds area labels from the repo's `.github/issue-triage/config.json`, and marks
+speculative ideas `proposal`. It comments only when it thinks something is
+wrong:
+
+| Label | Meaning | What happens next |
+|---|---|---|
+| `possible-duplicate` | same defect or feature as another issue | closed as a duplicate after 14 days if the author does not reply |
+| `not-an-issue` | support question, intended behaviour, out of scope, unclear, spam | closed as not planned after 14 days if the author does not reply |
+| `needs-triage` | queued for the agent | removed when triage succeeds |
+
+**It never closes on first sight**, and it never auto-closes issues filed by a
+maintainer or carrying `high-priority`, `security` or `no-stale`. If the author
+replies, the label comes off and the call is yours. To dismiss a wrong flag,
+remove the label. To ask for a re-triage, add `needs-triage`.
+
+A daily sweep also maps old label names onto the taxonomy and re-triages any
+issue that does not have exactly one type label, so a mislabel corrects itself
+within a day. Correcting the type yourself sticks: the agent only revisits an
+issue that has zero or several type labels.
+
 ---
 
 ## Bypassing the gates
