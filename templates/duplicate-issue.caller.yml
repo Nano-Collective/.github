@@ -1,0 +1,62 @@
+name: Duplicate Issue Check
+
+# Thin caller for the shared org workflow. The machinery lives in
+# Nano-Collective/.github — change it there and every repo picks it up on its
+# next run. What stays here is the trigger wiring and any project-specific
+# hint for the model.
+#
+# Before adopting this in a repo you need one thing:
+#
+#   MINIMAX_API_KEY readable here — set it once as an ORGANISATION secret with
+#   visibility "all". Organisation Actions secrets are available to public
+#   repositories on the Free plan (verified 2026-09-07), so there is no need
+#   to copy the key into each repo.
+#
+# `edited` is in the trigger list deliberately: a contributor who edits their
+# first draft into a real report should be re-triaged. The shared workflow
+# guards against re-label work by checking for an existing `duplicate` label
+# and the bot is excluded by the author check in `Skip if not worth checking`,
+# so the noise from `edited` on dependency-update bots is bounded.
+#
+# concurrency uses `cancel-in-progress: false`: if an `opened` run is still
+# going when `edited` fires, the second one waits. A stale duplicate claim is
+# worse than a delayed one.
+
+on:
+  issues:
+    types: [opened, edited]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to triage
+        required: true
+        type: string
+
+concurrency:
+  group: duplicate-issue-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  duplicate-issue:
+    uses: Nano-Collective/.github/.github/workflows/duplicate-issue.yml@main
+    permissions:
+      contents: read
+      issues: write
+    with:
+      # Only ever non-empty on workflow_dispatch, and that is deliberate. The
+      # shared workflow resolves the issue itself with
+      #   github.event.issue.number || inputs.issue-number
+      # so `issues` events are covered by the payload and this input is purely
+      # the manual-dispatch fallback. Do not duplicate that expression here —
+      # it would be the same logic in seven callers, drifting.
+      issue-number: ${{ inputs.issue_number }}
+      # Optional project-specific nudge for the model. Empty by default; pass
+      # anything that would help a human spot a true duplicate faster than the
+      # model would on its own.
+      similarity-hint: ''
+    secrets:
+      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
