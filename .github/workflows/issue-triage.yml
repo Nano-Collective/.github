@@ -535,8 +535,11 @@ jobs:
             if (!have.has(type)) add.push(type);
             for (const l of [...areas, ...flags]) if (!have.has(l)) add.push(l);
             if (v.proposal === true && !have.has('proposal')) add.push('proposal');
-            if (verdict === 'duplicate') add.push('possible-duplicate');
-            if (verdict === 'not-an-issue') add.push('not-an-issue');
+            // A re-triage of an issue that is already flagged must not flag it
+            // again: the label is idempotent, the comment is not.
+            const flagLabel = {duplicate: 'possible-duplicate', 'not-an-issue': 'not-an-issue'}[verdict];
+            const alreadyFlagged = flagLabel && have.has(flagLabel);
+            if (flagLabel && !alreadyFlagged) add.push(flagLabel);
             remove.push('needs-triage');
 
             core.info(`#${n}: ${verdict}${verdict === 'duplicate' ? ` of #${dupOf}` : ''}${verdict === 'not-an-issue' ? ` (${reason})` : ''} — ${str(v.summary)}`);
@@ -546,7 +549,7 @@ jobs:
 
             // ---- Comment, only when there is something to say ----
             let body = null;
-            if (verdict !== 'actionable') {
+            if (verdict !== 'actionable' && !alreadyFlagged) {
               const maintainerFiled = MAINTAINER.has(issue.author_association);
               const days = process.env.CLOSE_AFTER_DAYS;
               const mention = issue.user.type === 'Bot' ? '' : `@${issue.user.login} — `;
