@@ -421,6 +421,12 @@ jobs:
           NANOCODER_CONTEXT_LIMIT: ${{ inputs.context-limit }}
           MODEL: ${{ inputs.model }}
         run: |
+          # Actions runs this as `bash -e {0}`, so -e is on even though the set
+          # line below leaves it out. Switch it off: otherwise the first
+          # nanocoder exit 1 (rate limited, typically when several issues are
+          # filed within a minute) ends the step before the back-off and retry,
+          # failing the job instead of leaving the issue queued for the sweep.
+          set +e
           set -uo pipefail
           SCHEMA='{
             "verdict": "actionable | duplicate | not-an-issue",
@@ -454,10 +460,11 @@ jobs:
 
           for attempt in 1 2; do
             nanocoder run "$PROMPT" --mode yolo --model "$MODEL" --trust-directory
+            status=$?
             if [ -s .issue-triage/verdict.json ] && jq -e . .issue-triage/verdict.json >/dev/null 2>&1; then
               exit 0
             fi
-            echo "::warning::attempt $attempt produced no parseable verdict"
+            echo "::warning::attempt $attempt produced no parseable verdict (nanocoder exit $status)"
             # Rate limiting is the usual cause; back off before retrying.
             [ "$attempt" = 1 ] && sleep 60
           done
