@@ -327,6 +327,18 @@ jobs:
             // The set duplicate_of is validated against. Written by us, read by
             // the apply step — the model never gets to extend it.
             fs.writeFileSync('.issue-triage/corpus-numbers.json', JSON.stringify(corpus.map((c) => c.number)));
+            // One issue per line, in a file of its own. Never one JSON blob:
+            // read_file refuses any line over 10k chars as minified, and with
+            // the corpus unreadable the model reconstructed titles by grepping
+            // a word at a time until it hit the 200-turn cap or a rate limit.
+            // Line-per-issue also makes each search_file_contents hit a whole
+            // issue.
+            const oneLine = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            fs.writeFileSync('.issue-triage/corpus.md', corpus.map((c) => [
+              `#${c.number} [${c.state}] ${oneLine(c.title)}`,
+              c.labels?.length ? ` {${c.labels.join(', ')}}` : '',
+              c.excerpt ? ` — ${oneLine(c.excerpt)}` : '',
+            ].join('')).join('\n') + '\n');
 
             const list = (o) => Object.entries(o).map(([k, v]) => `- \`${k}\` — ${v}`).join('\n');
             const md = [
@@ -371,9 +383,8 @@ jobs:
               '',
               '## Existing issues (duplicate-detection corpus)',
               '',
-              '```json',
-              JSON.stringify(corpus),
-              '```',
+              `${corpus.length} issues are in .issue-triage/corpus.md, one per line: \`#number [state] title {labels} — excerpt\`.`,
+              'Search it with search_file_contents for the key terms of this issue, then read_file the lines around any hit.',
             ].join('\n');
             fs.writeFileSync('.issue-triage/context.md', md);
             core.info(`context: ${md.length} chars, corpus ${corpus.length} issues`);
@@ -390,9 +401,10 @@ jobs:
           {
             "nanocoder": {
               "disabledTools": [
-                "execute_bash", "fetch_url", "agent", "ask_user",
-                "string_replace", "diff_edit", "file_op",
-                "write_plan", "write_walkthrough",
+                "execute_bash", "fetch_url", "browser", "web_search",
+                "github_create_issue", "agent", "ask_user",
+                "string_replace", "diff_edit", "file_op", "lsp_format_document",
+                "write_plan", "write_tasks", "write_walkthrough",
                 "git_add", "git_branch", "git_commit", "git_diff", "git_log",
                 "git_pr", "git_pull", "git_push", "git_reset", "git_stash", "git_status"
               ],
@@ -452,8 +464,12 @@ jobs:
 
           Chat output is discarded. You are not finished until write_file has succeeded on .issue-triage/verdict.json.'
 
+          # Actions runs this with `bash -e`, and `set -uo pipefail` does not
+          # turn -e off, so a bare non-zero exit (rate limit, turn cap) ended
+          # the step before the retry or the verdict check could run. `|| true`
+          # keeps both; a missing verdict is handled by the apply step.
           for attempt in 1 2; do
-            nanocoder run "$PROMPT" --mode yolo --model "$MODEL" --trust-directory
+            nanocoder run "$PROMPT" --mode yolo --model "$MODEL" --trust-directory || true
             if [ -s .issue-triage/verdict.json ] && jq -e . .issue-triage/verdict.json >/dev/null 2>&1; then
               exit 0
             fi
