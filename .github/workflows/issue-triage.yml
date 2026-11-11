@@ -76,7 +76,7 @@ on:
       model:
         description: Model id to triage with.
         type: string
-        default: 'minimax-m3'
+        default: 'MiniMax-M3.1-Flash'
       provider-base-url:
         type: string
         default: 'https://api.minimax.io/anthropic/v1'

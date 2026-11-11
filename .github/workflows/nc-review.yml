@@ -75,7 +75,7 @@ on:
       model:
         description: Model id to review with.
         type: string
-        default: 'minimax-m3'
+        default: 'MiniMax-M3.1-Flash'
       provider-name:
         description: Display name for the provider block.
         type: string
@@ -98,7 +98,7 @@ on:
 
           This is NOT optional detail. @ai-sdk/anthropic reads the ceiling off
           the model id and falls back to 4096 for anything that is not a known
-          Claude model, and `minimax-m3` is not one — so leaving this unset caps
+          Claude model, and `MiniMax-M3.1-Flash` is not one — so leaving this unset caps
           every turn at 4096 tokens. A review that reasons before it acts hits
           that mid-sentence and stops, having never called write_file, which is
           precisely how runs ended with "could not produce a verdict".
@@ -518,6 +518,7 @@ jobs:
         id: agent
         env:
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          MODEL: ${{ inputs.model }}
           NANOCODER_CONTEXT_LIMIT: ${{ inputs.context-limit }}
           RUBRIC_PATH: ${{ inputs.rubric-path }}
           CONTRIBUTING_DOC: ${{ inputs.contributing-doc }}
@@ -675,7 +676,7 @@ jobs:
           set +e
           nanocoder run "$PROMPT" \
             --mode yolo \
-            --model minimax-m3 \
+            --model "$MODEL" \
             --trust-directory
           STATUS=$?
           set -e
@@ -708,7 +709,7 @@ jobs:
             set +e
             nanocoder run "$RETRY" \
               --mode yolo \
-              --model minimax-m3 \
+              --model "$MODEL" \
               --trust-directory
             STATUS=$?
             set -e
