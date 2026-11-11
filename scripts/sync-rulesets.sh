@@ -24,10 +24,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RULESET_DIR="$HERE/../rulesets"
 
 # Every package repo is on the standard 80% coverage threshold as of
-# 2026-09-07. nanoterm (90.56%) and nanotune (80.7%, nanotune#173) were the last
-# two held out by decision Q18, and both cleared the bar — no repo carries a
-# pinned floor any more.
-DEFAULT_REPOS="nanocoder sentinel prompt-scrubber get-md json-up nanoterm nanotune"
+# 2026-09-07. nanotune (80.7%, nanotune#173) was the last held out by decision
+# Q18, and it cleared the bar — no repo carries a pinned floor any more.
+DEFAULT_REPOS="nanocoder sentinel prompt-scrubber get-md json-up nanotune"
 REPOS="${REPOS:-$DEFAULT_REPOS}"
 
 # RepositoryRole bypass actor ids, resolved empirically on 2026-09-04 via
