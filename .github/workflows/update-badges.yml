@@ -36,8 +36,8 @@ name: Update Status Badges
 # ways to let it through:
 #
 #   PAT_TOKEN   A personal access token. The push is then made *as that user*,
-#               so it inherits their bypass. This is what every repo except
-#               nanoterm does today. It works, but it means a daily automated
+#               so it inherits their bypass. This is what every repo does
+#               today. It works, but it means a daily automated
 #               push wearing a human's credentials, and the rule suite records
 #               the bypass against them rather than against the bot — which
 #               makes "track bypass usage per actor" report a person for

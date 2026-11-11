@@ -244,10 +244,6 @@ sit with `will-lamerton`; merge rights do not.
 of the quality ruleset until it reaches 80. It carries the review ruleset only.
 Do not treat the pinned floor as the standard.
 
-**`nanoterm`** — was the other repo below the bar; it is now at 90.56% against a
-floor of 80 and has met the standard. It carries **no rulesets at all** and
-should be brought into both.
-
 **`sentinel`** — becoming the collective's conformance checker. Its
 `release.yml` publishes on merge to `main` when `package.json` is ahead of npm,
 so it does not need changesets to cut a release.
